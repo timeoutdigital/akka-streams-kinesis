@@ -7,6 +7,7 @@ import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
 import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.model._
 import com.timeout.KinesisProducerFlow.FetchRecords
+import org.slf4j.LoggerFactory
 
 import scala.collection.convert.{DecorateAsJava, DecorateAsScala}
 import scala.collection.mutable
@@ -27,7 +28,10 @@ object KinesisProducerFlow {
   * The trick is that it then puts any failed items back into the buffer
   */
 class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: ExecutionContext)
-  extends GraphStage[FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry]] with DecorateAsScala with DecorateAsJava {
+  extends GraphStage[FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry]]
+  with DecorateAsScala
+  with DecorateAsJava {
+  private val logger = LoggerFactory.getLogger(getClass)
   private val in = Inlet[PutRecordsRequestEntry]("PutRecordsRequestEntry")
   private val out = Outlet[PutRecordsResultEntry]("PutRecordsResultEntry")
   override def shape: FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry] = FlowShape(in, out)
@@ -84,7 +88,13 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: Ex
           .withRecords(dataToPush.asJava)
           .withStreamName(streamName)
 
-        val results = withRetries(fetch(request)).getRecords.asScala
+        def incrementalBackoff(err: Throwable, n: Int): Unit = {
+          val waitSec = Math.pow(2, n).toInt
+          logger.debug(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
+          Thread.sleep(waitSec * 1000)
+        }
+
+        val results = withRetries(fetch(request), onError = incrementalBackoff).getRecords.asScala
         /*
          * We rate limit ourselves here in the worker thread
          * Blocking in getAsyncCallback would block the entire stream
