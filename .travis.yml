@@ -1,0 +1,16 @@
+language: scala
+
+cache:
+  directories:
+    - $HOME/.ivy2/cache
+    - $HOME/.sbt/boot/
+    - $HOME/.embedpostgresql
+
+scala:
+  - 2.11.8
+
+jdk:
+  - oraclejdk8
+
+script:
+  - sbt test
