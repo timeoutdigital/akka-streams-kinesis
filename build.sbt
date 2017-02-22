@@ -2,8 +2,6 @@ name := "akka-streams-kinesis"
 
 organization := "com.timeout"
 
-version := "0.0.1"
-
 licenses += ("MIT", url("https://opensource.org/licenses/MIT"))
 
 scalaVersion := "2.11.8"
