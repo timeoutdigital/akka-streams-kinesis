@@ -49,27 +49,21 @@ class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: 
     /**
       * Respond to any kind of stream event
       * Whatever happens we want to add any new entries to the buffer
-      * then run through a series of checks:
-      *
-      *  - is the buffer empty and the producer closed? We're done here
-      *  - is the buffer full? Then lets dispatch the kinesis worker to clear it and lets not ask for more
-      *  - Is the producer closed? Then even if the buffer isn't full lets clear it
-      *  - is the buffer not full? Lets ask for something new
-      *
-      *  Note that we /either/ ask for new data or we push to kinesis - never both
-      *  We will therefore backpressure while waiting for kinesis to finish.
-      *  If we did everything synchronously we would block rather than backpressure
-      *  which would prevent us filling up any upstream buffers
       */
     private def streamStateChanged(newRecords: List[A] = List.empty) = {
       inputBuffer.enqueue(newRecords: _*)
 
+      // is the buffer empty and the producer closed? We're done here
       if (inputBuffer.isEmpty && isClosed(in) && recordsInFlight < 1) {
         completeStage()
+
+      // Is the producer closed? Then even if the buffer isn't full lets clear it
+      // is the buffer full? Then lets dispatch the kinesis worker to clear it
       } else if (recordsInFlight < 1 && (inputBuffer.length >= sendingThreshold || isClosed(in))) {
         pushToKinesis()
       }
 
+      // is the buffer not full? Lets ask for something new
       if (!hasBeenPulled(in) && !isClosed(in) && (inputBuffer.length + recordsInFlight) < maxBufferSize) {
         pull(in)
       }
@@ -134,7 +128,6 @@ class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: 
       override def onUpstreamFinish(): Unit = {
         streamStateChanged()
       }
-
 
       override def onPush(): Unit = {
         val entry = grab(in)
