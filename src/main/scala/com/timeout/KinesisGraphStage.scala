@@ -1,23 +1,25 @@
 package com.timeout
 
+import java.util.concurrent.Executors
+
 import akka.NotUsed
 import akka.stream.scaladsl.Flow
 import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
 import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.model._
-import com.timeout.KinesisProducerFlow.FetchRecords
+import com.timeout.KinesisGraphStage.FetchRecords
 import org.slf4j.LoggerFactory
 
 import scala.collection.convert.{DecorateAsJava, DecorateAsScala}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
-object KinesisProducerFlow {
+object KinesisGraphStage {
   type FetchRecords = PutRecordsRequest => PutRecordsResult
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
 
-  def withClient(client: AmazonKinesisClient, streamName: String)(implicit ec: ExecutionContext): Flow[PutRecordsRequestEntry, PutRecordsResultEntry, NotUsed] =
+  def withClient(client: AmazonKinesisClient, streamName: String): Flow[PutRecordsRequestEntry, PutRecordsResultEntry, NotUsed] =
     Flow.fromGraph(new KinesisGraphStage(client.putRecords, streamName))
 }
 
@@ -27,7 +29,7 @@ object KinesisProducerFlow {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: ExecutionContext)
+class KinesisGraphStage(fetch: FetchRecords, streamName: String)
   extends GraphStage[FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry]]
   with DecorateAsScala
   with DecorateAsJava {
@@ -42,6 +44,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: Ex
     private val kinesisBackoffTime = 800
     private var recordsInFlight: Int = 0
     private val inputBuffer = mutable.Queue.empty[PutRecordsRequestEntry]
+    private implicit val ec = ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor)
 
     /**
       * Respond to any kind of stream event
@@ -100,7 +103,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: Ex
          * Blocking in getAsyncCallback would block the entire stream
          * While here the stream can continue to fill any buffers preceeding us
          */
-        val throttled = results.count(_.getErrorCode == KinesisProducerFlow.ProvisionedThroughputExceededExceptionCode)
+        val throttled = results.count(_.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode)
         if (throttled > 0) {
           Thread.sleep(kinesisBackoffTime)
         }
@@ -111,7 +114,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)(implicit ec: Ex
 
         // in here we're back in an akka streams managed thread
         val (throughputErrors, otherResults) = resultsAndRequests.partition { case (err, _) =>
-          err.getErrorCode == KinesisProducerFlow.ProvisionedThroughputExceededExceptionCode
+          err.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode
         }
 
         emitMultiple(out, otherResults.map(_._1))
