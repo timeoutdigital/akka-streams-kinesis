@@ -29,7 +29,7 @@ object KinesisGraphStage {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: String)
+class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String)
   extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]]
   with DecorateAsScala
   with DecorateAsJava {
@@ -90,7 +90,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: 
           Thread.sleep(waitSec * 1000)
         }
 
-        val results = withRetries(fetch(request), onError = incrementalBackoff).getRecords.asScala
+        val results = withRetries(putRecords(request), onError = incrementalBackoff).getRecords.asScala
         /*
          * We rate limit ourselves here in the worker thread
          * Blocking in getAsyncCallback would block the entire stream
