@@ -86,7 +86,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
 
         def incrementalBackoff(err: Throwable, n: Int): Unit = {
           val waitSec = Math.pow(2, n).toInt
-          logger.debug(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
+          logger.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
           Thread.sleep(waitSec * 1000)
         }
 
@@ -110,6 +110,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
           err.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode
         }
 
+        logger.debug(s"pushed ${otherResults.size}/${resultsAndRequests.size} records to kinesis")
         val (errors, successes) = otherResults.partition { case(result, _) => result.getErrorCode != null }
         val results = errors.map(e => Left(e._1)) ++ successes.map(s => Right(s._2))
         emitMultiple(out, results)
