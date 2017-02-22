@@ -48,7 +48,6 @@ class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: 
 
     /**
       * Respond to any kind of stream event
-      * Whatever happens we want to add any new entries to the buffer
       */
     private def streamStateChanged(newRecords: List[A] = List.empty) = {
       inputBuffer.enqueue(newRecords: _*)
@@ -76,7 +75,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: 
       */
     def pushToKinesis(): Unit = {
       val dataToPush = inputBuffer.toList
-      inputBuffer.clear // surely there must be a collection with a removeN
+      inputBuffer.clear
       recordsInFlight = dataToPush.size
 
       Future {
