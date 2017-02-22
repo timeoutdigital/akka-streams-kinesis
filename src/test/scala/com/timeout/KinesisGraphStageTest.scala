@@ -24,13 +24,13 @@ class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceC
     .withFailedRecordCount(records.count(_.getErrorCode != null))
     .withRecords(records.asJava)
 
-  val successClient: KinesisGraphStage.FetchRecords = r =>
+  val successClient: KinesisGraphStage.PutRecords = r =>
     result(r.getRecords.asScala.map(_ => resultEntry).toList)
 
-  val failingClient: KinesisGraphStage.FetchRecords = r =>
+  val failingClient: KinesisGraphStage.PutRecords = r =>
     result((1 to r.getRecords.size).map(_ => resultEntry.withErrorMessage("Failure").withErrorCode("F")))
 
-  def kinesis(client: KinesisGraphStage.FetchRecords) =
+  def kinesis(client: KinesisGraphStage.PutRecords) =
     new KinesisGraphStage[PutRecordsRequestEntry](client, "test")
 
 
@@ -48,7 +48,7 @@ class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceC
 
     "Retry sending if kinesis fails due to throughput exceptions" in {
 
-      val throttledClient: KinesisGraphStage.FetchRecords = r =>
+      val throttledClient: KinesisGraphStage.PutRecords = r =>
         if (r.getRecords.size == 3) {
           result(Seq(resultEntry, resultEntry, resultEntry
             .withErrorCode(ProvisionedThroughputExceededExceptionCode)

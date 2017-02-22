@@ -8,7 +8,7 @@ import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
 import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
 import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.model._
-import com.timeout.KinesisGraphStage.FetchRecords
+import com.timeout.KinesisGraphStage.PutRecords
 import org.slf4j.LoggerFactory
 import ToPutRecordsRequest._
 import scala.collection.convert.{DecorateAsJava, DecorateAsScala}
@@ -16,7 +16,7 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
 object KinesisGraphStage {
-  type FetchRecords = PutRecordsRequest => PutRecordsResult
+  type PutRecords = PutRecordsRequest => PutRecordsResult
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
 
   def withClient[A : ToPutRecordsRequest](client: AmazonKinesisClient, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
@@ -29,7 +29,7 @@ object KinesisGraphStage {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage[A : ToPutRecordsRequest](fetch: FetchRecords, streamName: String)
+class KinesisGraphStage[A : ToPutRecordsRequest](fetch: PutRecords, streamName: String)
   extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]]
   with DecorateAsScala
   with DecorateAsJava {
