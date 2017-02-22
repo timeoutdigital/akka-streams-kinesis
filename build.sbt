@@ -14,6 +14,8 @@ libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.4.14"
 
 libraryDependencies += "org.slf4j" % "slf4j-api" % "1.7.21"
 
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.1" % "test"
+
 credentials += Credentials(Path.userHome / ".bintray" / ".credentials")
 
 lazy val root = (project in file("."))
