@@ -16,6 +16,8 @@ libraryDependencies += "org.slf4j" % "slf4j-api" % "1.7.21"
 
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.1" % "test"
 
+libraryDependencies += "org.slf4j" % "slf4j-nop" % "1.7.23" % "test"
+
 credentials += Credentials(Path.userHome / ".bintray" / ".credentials")
 
 lazy val root = (project in file("."))
