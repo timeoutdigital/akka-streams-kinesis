@@ -12,6 +12,7 @@ import scala.collection.JavaConverters._
 
 class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceConfiguration with ScalaFutures {
   implicit override val patienceConfig = PatienceConfig(timeout = Span(5, Seconds), interval = Span(5, Millis))
+  implicit val idToPutRecordsRequest = ToPutRecordsRequest.instance(identity[PutRecordsRequestEntry])
 
   def requestEntry(id: Int) =
     new PutRecordsRequestEntry().withData(ByteBuffer.wrap(s"num: $id".getBytes))
@@ -30,19 +31,19 @@ class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceC
     result((1 to r.getRecords.size).map(_ => resultEntry.withErrorMessage("Failure").withErrorCode("F")))
 
   def kinesis(client: KinesisGraphStage.FetchRecords) =
-    new KinesisGraphStage(client, "test")
+    new KinesisGraphStage[PutRecordsRequestEntry](client, "test")
 
 
   "Kinesis graph stage" - {
 
-    "Emit the right number of results when everything works" in {
+    "pass through the right number of requests when everything works" in {
       val output = Source(0 to 4).map(requestEntry).via(kinesis(successClient)).runWith(Sink.seq)
-      whenReady(output)(_ shouldEqual (0 to 4).map(_ => resultEntry))
+      whenReady(output)(_ shouldEqual (0 to 4).map(id => Right(requestEntry(id))))
     }
 
     "Emit the right number of failures when kinesis fails for reasons other than throughput" in {
       val output = Source.single(requestEntry(id = 0)).via(kinesis(failingClient)).runWith(Sink.seq)
-      whenReady(output)(_ shouldEqual List(resultEntry.withErrorMessage("Failure").withErrorCode("F")))
+      whenReady(output)(_ shouldEqual List(Left(resultEntry.withErrorMessage("Failure").withErrorCode("F"))))
     }
 
     "Retry sending if kinesis fails due to throughput exceptions" in {
@@ -61,7 +62,7 @@ class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceC
         .via(kinesis(throttledClient)).runWith(Sink.seq)
 
       whenReady(output) { res =>
-        res shouldEqual (0 to 2).map(_ => resultEntry)
+        res shouldEqual (0 to 2).map(id => Right(requestEntry(id)))
       }
     }
   }

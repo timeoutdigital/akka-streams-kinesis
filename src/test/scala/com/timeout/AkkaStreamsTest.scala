@@ -13,5 +13,4 @@ trait AkkaStreamsTest extends FreeSpec with BeforeAndAfterAll {
     super.afterAll()
     as.terminate()
   }
-
 }

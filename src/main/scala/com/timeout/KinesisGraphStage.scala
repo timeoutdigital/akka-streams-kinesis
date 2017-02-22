@@ -10,7 +10,7 @@ import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.model._
 import com.timeout.KinesisGraphStage.FetchRecords
 import org.slf4j.LoggerFactory
-
+import ToPutRecordsRequest._
 import scala.collection.convert.{DecorateAsJava, DecorateAsScala}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
@@ -19,8 +19,8 @@ object KinesisGraphStage {
   type FetchRecords = PutRecordsRequest => PutRecordsResult
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
 
-  def withClient(client: AmazonKinesisClient, streamName: String): Flow[PutRecordsRequestEntry, PutRecordsResultEntry, NotUsed] =
-    Flow.fromGraph(new KinesisGraphStage(client.putRecords, streamName))
+  def withClient[A : ToPutRecordsRequest](client: AmazonKinesisClient, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
+    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
 }
 
 /**
@@ -29,21 +29,21 @@ object KinesisGraphStage {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage(fetch: FetchRecords, streamName: String)
-  extends GraphStage[FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry]]
+class KinesisGraphStage[A : ToPutRecordsRequest](fetch: FetchRecords, streamName: String)
+  extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]]
   with DecorateAsScala
   with DecorateAsJava {
   private val logger = LoggerFactory.getLogger(getClass)
-  private val in = Inlet[PutRecordsRequestEntry]("PutRecordsRequestEntry")
-  private val out = Outlet[PutRecordsResultEntry]("PutRecordsResultEntry")
-  override def shape: FlowShape[PutRecordsRequestEntry, PutRecordsResultEntry] = FlowShape(in, out)
+  private val in = Inlet[A]("PutRecordsRequestEntry")
+  private val out = Outlet[Either[PutRecordsResultEntry, A]]("PutRecordsResultEntry")
+  override def shape: FlowShape[A, Either[PutRecordsResultEntry, A]] = FlowShape(in, out)
 
   override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
     private val sendingThreshold = 250
     private val maxBufferSize = 500 // hard limit imposed by AWS
     private val kinesisBackoffTime = 800
     private var recordsInFlight: Int = 0
-    private val inputBuffer = mutable.Queue.empty[PutRecordsRequestEntry]
+    private val inputBuffer = mutable.Queue.empty[A]
     private implicit val ec = ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor)
 
     /**
@@ -61,7 +61,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)
       *  If we did everything synchronously we would block rather than backpressure
       *  which would prevent us filling up any upstream buffers
       */
-    private def streamStateChanged(newRecords: List[PutRecordsRequestEntry] = List.empty) = {
+    private def streamStateChanged(newRecords: List[A] = List.empty) = {
       inputBuffer.enqueue(newRecords: _*)
 
       if (inputBuffer.isEmpty && isClosed(in) && recordsInFlight < 1) {
@@ -88,7 +88,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)
       Future {
         // everything in here happens in an async worker thread
         val request = new PutRecordsRequest()
-          .withRecords(dataToPush.asJava)
+          .withRecords(dataToPush.map(_.toRequestEntry).asJava)
           .withStreamName(streamName)
 
         def incrementalBackoff(err: Throwable, n: Int): Unit = {
@@ -109,7 +109,7 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)
         }
 
         results.zip(dataToPush).toList
-      }.foreach(getAsyncCallback[List[(PutRecordsResultEntry, PutRecordsRequestEntry)]] { resultsAndRequests =>
+      }.foreach(getAsyncCallback[List[(PutRecordsResultEntry, A)]] { resultsAndRequests =>
         recordsInFlight = 0
 
         // in here we're back in an akka streams managed thread
@@ -117,7 +117,9 @@ class KinesisGraphStage(fetch: FetchRecords, streamName: String)
           err.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode
         }
 
-        emitMultiple(out, otherResults.map(_._1))
+        val (errors, successes) = otherResults.partition { case(result, _) => result.getErrorCode != null }
+        val results = errors.map(e => Left(e._1)) ++ successes.map(s => Right(s._2))
+        emitMultiple(out, results)
 
         // put any failures back into the buffer
         streamStateChanged(throughputErrors.map(_._2))
