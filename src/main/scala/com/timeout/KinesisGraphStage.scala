@@ -4,20 +4,25 @@ import java.util.concurrent.Executors
 
 import akka.NotUsed
 import akka.stream.scaladsl.Flow
-import akka.stream.stage.{GraphStage, GraphStageLogic, InHandler, OutHandler}
+import akka.stream.stage._
 import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
 import com.amazonaws.services.kinesis.AmazonKinesisClient
 import com.amazonaws.services.kinesis.model._
 import com.timeout.KinesisGraphStage.PutRecords
-import org.slf4j.LoggerFactory
-import ToPutRecordsRequest._
-import scala.collection.convert.{DecorateAsJava, DecorateAsScala}
+import com.timeout.ToPutRecordsRequest._
+
+import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
 object KinesisGraphStage {
+
   type PutRecords = PutRecordsRequest => PutRecordsResult
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
+
+  private[KinesisGraphStage] val maxBufferSize = 500 // hard limit imposed by AWS
+  private[KinesisGraphStage] val sendingThreshold = 250
+  private[KinesisGraphStage] val kinesisBackoffTime = 800
 
   def withClient[A : ToPutRecordsRequest](client: AmazonKinesisClient, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
     Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
@@ -30,18 +35,15 @@ object KinesisGraphStage {
   * The trick is that it then puts any failed items back into the buffer
   */
 class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String)
-  extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]]
-  with DecorateAsScala
-  with DecorateAsJava {
-  private val logger = LoggerFactory.getLogger(getClass)
+  extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]] {
+
   private val in = Inlet[A]("PutRecordsRequestEntry")
   private val out = Outlet[Either[PutRecordsResultEntry, A]]("PutRecordsResultEntry")
   override def shape: FlowShape[A, Either[PutRecordsResultEntry, A]] = FlowShape(in, out)
 
-  override def createLogic(inheritedAttributes: Attributes): GraphStageLogic = new GraphStageLogic(shape) {
-    private val sendingThreshold = 250
-    private val maxBufferSize = 500 // hard limit imposed by AWS
-    private val kinesisBackoffTime = 800
+  override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) with StageLogging {
+
+    import KinesisGraphStage._
     private var recordsInFlight: Int = 0
     private val inputBuffer = mutable.Queue.empty[A]
     private implicit val ec = ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor)
@@ -56,8 +58,8 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
       if (inputBuffer.isEmpty && isClosed(in) && recordsInFlight < 1) {
         completeStage()
 
-      // Is the producer closed? Then even if the buffer isn't full lets clear it
       // is the buffer full? Then lets dispatch the kinesis worker to clear it
+      // otherwise is the producer closed? Then even if the buffer isn't full lets clear it
       } else if (recordsInFlight < 1 && (inputBuffer.length >= sendingThreshold || isClosed(in))) {
         pushToKinesis()
       }
@@ -79,14 +81,14 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
       recordsInFlight = dataToPush.size
 
       Future {
-        // everything in here happens in an async worker thread
+        // everything in here happens in the worker thread
         val request = new PutRecordsRequest()
           .withRecords(dataToPush.map(_.toRequestEntry).asJava)
           .withStreamName(streamName)
 
         def incrementalBackoff(err: Throwable, n: Int): Unit = {
           val waitSec = Math.pow(2, n).toInt
-          logger.debug(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
+          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
           Thread.sleep(waitSec * 1000)
         }
 
@@ -94,9 +96,9 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
         /*
          * We rate limit ourselves here in the worker thread
          * Blocking in getAsyncCallback would block the entire stream
-         * While here the stream can continue to fill any buffers preceeding us
+         * While here the stream can continue to fill any buffers preceding us
          */
-        val throttled = results.count(_.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode)
+        val throttled = results.count(_.getErrorCode == ProvisionedThroughputExceededExceptionCode)
         if (throttled > 0) {
           Thread.sleep(kinesisBackoffTime)
         }
@@ -107,10 +109,11 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
 
         // in here we're back in an akka streams managed thread
         val (throughputErrors, otherResults) = resultsAndRequests.partition { case (err, _) =>
-          err.getErrorCode == KinesisGraphStage.ProvisionedThroughputExceededExceptionCode
+          err.getErrorCode == ProvisionedThroughputExceededExceptionCode
         }
 
-        val (errors, successes) = otherResults.partition { case(result, _) => result.getErrorCode != null }
+        log.debug(s"pushed ${otherResults.size}/${resultsAndRequests.size} records to kinesis")
+        val (errors, successes) = otherResults.partition { case (result, _) => result.getErrorCode != null }
         val results = errors.map(e => Left(e._1)) ++ successes.map(s => Right(s._2))
         emitMultiple(out, results)
 
@@ -119,23 +122,19 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
       }.invoke(_))
     }
 
-    override def beforePreStart(): Unit =
+    override def beforePreStart() =
       streamStateChanged()
 
     setHandler(in, new InHandler {
-
-      override def onUpstreamFinish(): Unit = {
+      override def onUpstreamFinish() =
         streamStateChanged()
-      }
-
-      override def onPush(): Unit = {
-        val entry = grab(in)
-        streamStateChanged(List(entry))
-      }
+      override def onPush() =
+        streamStateChanged(List(grab(in)))
     })
 
     setHandler(out, new OutHandler {
-      override def onPull(): Unit = streamStateChanged(List.empty)
+      override def onPull() =
+        streamStateChanged(List.empty)
     })
   }
 }
