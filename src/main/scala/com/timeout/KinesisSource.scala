@@ -44,7 +44,7 @@ private[timeout] class KinesisSource(stream: String, since: ZonedDateTime)(impli
     // stores futures from kinesis get records requests
     val buffer = mutable.Map.empty[String, JavaFuture[GetRecordsResult]]
 
-    Future { // todo this fails totally silently at the moment
+    Future {
       kinesis.describeStream(stream).getStreamDescription.getShards.asScala.par.map { shard =>
         val req = new GetShardIteratorRequest()
           .withShardIteratorType("AT_TIMESTAMP")
@@ -54,8 +54,9 @@ private[timeout] class KinesisSource(stream: String, since: ZonedDateTime)(impli
         val it = kinesis.getShardIterator(req).getShardIterator
         it -> kinesis.getRecordsAsync(new GetRecordsRequest().withShardIterator(it))
       }.toMap.seq
-    }.foreach(getAsyncCallback[Map[String, JavaFuture[GetRecordsResult]]] { iterators =>
-      iterators.foreach(buffer += _)
+    }.onComplete(getAsyncCallback[Try[Map[String, JavaFuture[GetRecordsResult]]]] { iterators =>
+      val unsafeIterators = iterators.get // trigger an exception if we could not bootstrap
+      unsafeIterators.foreach(buffer += _)
     }.invoke(_))
 
     setHandler(outlet, new OutHandler {
