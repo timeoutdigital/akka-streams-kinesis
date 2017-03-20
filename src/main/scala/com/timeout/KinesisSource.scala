@@ -75,8 +75,13 @@ private[timeout] class KinesisSource(stream: String, since: ZonedDateTime)(impli
         buffer.remove(iterator)
         val result = Try(future.get)
         val newIterator = result.toOption.fold(iterator)(_.getNextShardIterator)
-        emitMultiple(outlet, result.toOption.toList.flatMap(_.getRecords.asScala.map(_.getData).toList))
-        buffer += newIterator -> kinesis.getRecordsAsync(new GetRecordsRequest().withShardIterator(newIterator))
+        val newFuture = newIterator -> kinesis.getRecordsAsync(new GetRecordsRequest().withShardIterator(newIterator))
+
+        log.info(s"Emitting ${result.toOption.map(_.getRecords.size).getOrElse(0)} records...")
+        emitMultiple(outlet, result.toOption.toList.flatMap(_.getRecords.asScala.map(_.getData).toList), { () =>
+          buffer += newFuture
+          ()
+        })
       }
     }
   }
