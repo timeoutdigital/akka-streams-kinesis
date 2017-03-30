@@ -8,7 +8,7 @@ import java.util.concurrent.{Future => JavaFuture}
 import akka.stream.scaladsl.Source
 import akka.stream.stage.{GraphStage, OutHandler, StageLogging, TimerGraphStageLogic}
 import akka.stream.{Attributes, Outlet, SourceShape}
-import com.amazonaws.regions.Regions
+import com.amazonaws.regions.{Region, Regions}
 import com.amazonaws.services.kinesis.AmazonKinesisAsyncClient
 import com.amazonaws.services.kinesis.model.{GetRecordsRequest, GetRecordsResult, GetShardIteratorRequest}
 
@@ -24,7 +24,7 @@ object KinesisSource {
     Source.fromGraph(new KinesisSource(stream, since))
 
   private[timeout] lazy val kinesis: AmazonKinesisAsyncClient = new AmazonKinesisAsyncClient()
-    .withRegion(Regions.EU_WEST_1) //todo why isn't this picked up from credentials
+    .withRegion(Option(Regions.getCurrentRegion).getOrElse(Region.getRegion(Regions.EU_WEST_1)))
 }
 
 /**
@@ -77,7 +77,7 @@ private[timeout] class KinesisSource(stream: String, since: ZonedDateTime)(impli
         val newIterator = result.toOption.fold(iterator)(_.getNextShardIterator)
         val newFuture = newIterator -> kinesis.getRecordsAsync(new GetRecordsRequest().withShardIterator(newIterator))
 
-        log.info(s"Emitting ${result.toOption.map(_.getRecords.size).getOrElse(0)} records...")
+        log.debug(s"Emitting ${result.toOption.map(_.getRecords.size).getOrElse(0)} records...")
         emitMultiple(outlet, result.toOption.toList.flatMap(_.getRecords.asScala.map(_.getData).toList), { () =>
           buffer += newFuture
           ()
