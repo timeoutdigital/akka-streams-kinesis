@@ -9,9 +9,9 @@ import akka.NotUsed
 import akka.stream.scaladsl.Source
 import akka.stream.stage.{GraphStage, OutHandler, StageLogging, TimerGraphStageLogic}
 import akka.stream.{Attributes, Outlet, SourceShape}
-import com.amazonaws.regions.{Region, Regions}
-import com.amazonaws.services.kinesis.AmazonKinesisAsyncClient
+import com.amazonaws.regions.Regions
 import com.amazonaws.services.kinesis.model._
+import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -21,12 +21,13 @@ import scala.util.Try
 
 object KinesisSource {
 
-  private [timeout] val region: Region =
+  private [timeout] val region: Regions =
     Option(Regions.getCurrentRegion)
-      .getOrElse(Region.getRegion(Regions.EU_WEST_1))
+      .map(r => Regions.fromName(r.getName))
+      .getOrElse(Regions.EU_WEST_1)
 
-  private[timeout] lazy val kinesis: AmazonKinesisAsyncClient =
-    new AmazonKinesisAsyncClient().withRegion(region)
+  private[timeout] lazy val kinesis: AmazonKinesisAsync =
+    AmazonKinesisAsyncClientBuilder.standard.withRegion(region).build
 
   /**
     * This creates a source that reads records from AWS Kinesis.
