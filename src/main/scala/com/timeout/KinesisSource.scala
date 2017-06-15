@@ -188,7 +188,7 @@ private[timeout] class KinesisSource(
       case Failure(_: ExpiredIteratorException) =>
         reissueThenGetRecords(iterator)
       case Failure(error) =>
-        log.debug(error.getMessage)
+        log.error(error.getMessage)
         getRecords(iterator)
     }
   }
