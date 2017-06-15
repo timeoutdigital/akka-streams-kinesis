@@ -8,13 +8,14 @@ import akka.NotUsed
 import akka.stream.scaladsl.Source
 import akka.stream.stage.{GraphStage, OutHandler, StageLogging, TimerGraphStageLogic}
 import akka.stream.{Attributes, Outlet, SourceShape}
+import com.amazonaws.AmazonWebServiceRequest
 import com.amazonaws.handlers.AsyncHandler
 import com.amazonaws.regions.Regions
 import com.amazonaws.services.kinesis.model._
 import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
 
 import scala.collection.JavaConverters._
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success, Try}
 
 object KinesisSource {
@@ -84,17 +85,6 @@ object KinesisSource {
       .withStreamName(stream.getStreamName)
       .withShardId(shard.getShardId)
   }
-
-  private def futureAsyncHandler: (Future[GetRecordsResult], AsyncHandler[GetRecordsRequest, GetRecordsResult]) = {
-    val promise = Promise[GetRecordsResult]()
-    val handler = new AsyncHandler[GetRecordsRequest, GetRecordsResult] {
-      override def onError(exception: Exception) =
-        promise.failure(exception)
-      override def onSuccess(request: GetRecordsRequest, result: GetRecordsResult) =
-        promise.success(result)
-    }
-    promise.future -> handler
-  }
 }
 
 /**
@@ -115,25 +105,47 @@ private[timeout] class KinesisSource(
 
   override def createLogic(attrs: Attributes) = new TimerGraphStageLogic(shape) with StageLogging {
 
-    setHandler(outlet, new OutHandler {
-      override def onPull() = Unit // This stage pushes
-    })
-
-    // kick things off by getting an iterator for every shard
-    private val iterators: Future[List[ShardIterator]] = Future {
-      val stream = kinesis.describeStream(streamName).getStreamDescription
-      shardIteratorRequests(since, stream).toStream.par.map { shardReq =>
-        val i = kinesis.getShardIterator(shardReq).getShardIterator
-        ShardIterator(i, shardReq)
-      }.toList
+    /**
+      * Adapt Amazon's 2 argument AsyncHandler based functions to execute a block on completion,
+      * using Akka Streams' threadsafe getAsyncCallback function
+      *
+      * In most case the request argument is the same as the request the AsyncHandler gives you
+      * but describeStreamAsync lets you pass in a string stream name, so we need a different type
+      */
+    private def run[A, Req <: AmazonWebServiceRequest, Resp](
+      requestArgument: A
+    )(
+      amazonAsyncFunction: (A, AsyncHandler[Req, Resp]) => Any
+    )(
+      whenDone: Try[Resp] => Unit
+    ) = {
+      val callback = getAsyncCallback[Try[Resp]](whenDone)
+      val handler = new AsyncHandler[Req, Resp] {
+        override def onError(exception: Exception) = callback.invoke(Failure(exception))
+        override def onSuccess(request: Req, result: Resp) = callback.invoke(Success(result))
+      }
+      amazonAsyncFunction(requestArgument, handler)
     }
 
-    // now we want to begin the getRecords / emitThenGetNextRecords loop for each
-    iterators.onComplete(getAsyncCallback[Try[List[ShardIterator]]] { iterators =>
-      val unsafeIterators = iterators.get // cause the exception to be thrown
-      log.debug(s"$streamName - reading from ${unsafeIterators.length} shard(s)")
-      unsafeIterators.foreach(getRecords)
-    }.invoke(_))
+    /**
+      * We don't want to respond to any pull events from downstream
+      * as we're going to push records to them as quickly as we can
+      */
+    setHandler(outlet, new OutHandler {
+      override def onPull() = Unit
+    })
+
+    /**
+      * bootstrap everything by getting initial shard iterators
+      * Any errors here are essentially unrecoverable so we explode, hence the .gets
+      */
+    run(streamName)(kinesis.describeStreamAsync) { stream =>
+      shardIteratorRequests(since, stream.get.getStreamDescription).foreach { request =>
+        run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
+          getRecords(ShardIterator(iteratorResult.get.getShardIterator, request))
+        }
+      }
+    }
 
     /**
       * Get records from Kinesis, then call handleResult
@@ -141,11 +153,8 @@ private[timeout] class KinesisSource(
       */
     //noinspection AccessorLikeMethodIsUnit
     private def getRecords(it: ShardIterator): Unit = {
-      val (future, handler) = futureAsyncHandler
-      val callback = getAsyncCallback[Try[GetRecordsResult]](handleResult(it))
       val request = new GetRecordsRequest().withShardIterator(it.iterator)
-      kinesis.getRecordsAsync(request, handler)
-      future.onComplete(callback.invoke)
+      run(request)(kinesis.getRecordsAsync)(handleResult(it))
     }
 
     /**
@@ -154,8 +163,7 @@ private[timeout] class KinesisSource(
       */
     private def emitThenGetRecords(currentIterator: ShardIterator, result: GetRecordsResult): Unit = {
       emitMultiple[ByteBuffer](outlet, result.getRecords.asScala.map(_.getData).toList, { () =>
-        val it = nextIterator(currentIterator, result)
-        getRecords(it)
+        getRecords(nextIterator(currentIterator, result))
       })
     }
 
@@ -165,18 +173,16 @@ private[timeout] class KinesisSource(
       */
     private def reissueThenGetRecords(iterator: ShardIterator): Unit = {
       log.debug(s"$streamName - reissuing shard iterator")
-      Future {
-        kinesis.getShardIterator(iterator.reissue)
-      }.onComplete(getAsyncCallback[Try[GetShardIteratorResult]] { r =>
+      run(iterator.reissue)(kinesis.getShardIteratorAsync) { r =>
         getRecords(iterator.copy(iterator = r.get.getShardIterator))
-      }.invoke(_))
+      }
     }
 
     /**
       * Handle the results of a Kinesis GetRecords call by dispatching
       * to the above functions dependent on what happened.
       */
-    private def handleResult(iterator: ShardIterator)(result: Try[GetRecordsResult]) = result match {
+    private def handleResult(iterator: ShardIterator)(res: Try[GetRecordsResult]) = res match {
       case Success(recordsResult) =>
         emitThenGetRecords(iterator, recordsResult)
       case Failure(_: ExpiredIteratorException) =>
