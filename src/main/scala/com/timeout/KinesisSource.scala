@@ -6,7 +6,7 @@ import java.util.Date
 
 import akka.NotUsed
 import akka.stream.scaladsl.Source
-import akka.stream.stage.{GraphStage, OutHandler, StageLogging, TimerGraphStageLogic}
+import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
 import com.amazonaws.AmazonWebServiceRequest
 import com.amazonaws.handlers.AsyncHandler
@@ -103,7 +103,7 @@ private[timeout] class KinesisSource(
   val outlet = Outlet[ByteBuffer]("Kinesis Records")
   override def shape = SourceShape[ByteBuffer](outlet)
 
-  override def createLogic(attrs: Attributes) = new TimerGraphStageLogic(shape) with StageLogging {
+  override def createLogic(attrs: Attributes) = new GraphStageLogic(shape) with StageLogging {
 
     /**
       * Adapt Amazon's 2 argument AsyncHandler based functions to execute a block on completion,
