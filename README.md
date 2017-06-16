@@ -8,6 +8,8 @@ being used in Time Out's data ingestion pipeline and is under active development
 
 ## Installation
 
+Add the following to your `build.sbt`:
+
 ```scala
 resolvers += Resolver.bintrayRepo("timeoutdigital", "releases")
 libraryDependencies += "com.timeout" %% "akka-streams-kinesis" % "0.1.6"
@@ -15,7 +17,7 @@ libraryDependencies += "com.timeout" %% "akka-streams-kinesis" % "0.1.6"
 
 ## Reading from Kinesis
 
-You can read from Kinesis with `KinesisSource`, which uses the AsyncKinesisClient internally. 
+You can read from Kinesis with `KinesisSource`, which uses the `AmazonKinesisAsync` client internally. 
 
 ```scala
 import com.timeout.KinesisSource
@@ -32,9 +34,11 @@ val stage = KinesisSource("my-stream-name", since = since)
  
 ## Writing to Kinesis
 
-You can write to Kinesis with `KinesisGraphStage`. It maintains an internal buffer of records which it flushes periodically to Kinesis. and emits a stream of  `Either[PutRecordsResultEntry, A]` where the left is any failed results from kinesis and the right is the records pushed successfully.
+You can write to Kinesis with `KinesisGraphStage`. It maintains an internal buffer of records which it flushes periodically to Kinesis. and emits a stream of  `Either[PutRecordsResultEntry, A]` where the left is any failed results from Kinesis and the right is the records pushed successfully.
 
-KinesisGraphStage expects you to implement a typeclass `ToPutRecordsRequest[A]` which tells it how to convert the contents of your stream into a `PutRecordsRequest`.
+`KinesisGraphStage` expects you to implement a typeclass `ToPutRecordsRequest[A]` which tells it how to convert the contents of your stream into a `PutRecordsRequest`.
+
+Here's an example of how to write a Stream of `String`s to Kinesis:
 
 ```scala
 import java.nio.ByteBuffer
