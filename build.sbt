@@ -6,6 +6,10 @@ licenses += ("MIT", url("https://opensource.org/licenses/MIT"))
 
 scalaVersion := "2.11.8"
 
+crossScalaVersions := Seq("2.12.2")
+
+releaseCrossBuild := true
+
 libraryDependencies += "com.amazonaws" % "aws-java-sdk-kinesis" % "1.11.60"
 
 libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.4.17"
