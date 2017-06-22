@@ -10,13 +10,11 @@ crossScalaVersions := Seq("2.11.8", "2.12.2")
 
 releaseCrossBuild := true
 
-libraryDependencies += "com.amazonaws" % "aws-java-sdk-kinesis" % "1.11.60"
+libraryDependencies += "com.amazonaws" % "aws-java-sdk-kinesis" % "1.11.152"
 
-libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.4.17"
+libraryDependencies += "com.typesafe.akka" %% "akka-stream" % "2.4.19"
 
-libraryDependencies += "org.slf4j" % "slf4j-api" % "1.7.21"
-
-libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.1" % "test"
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.3" % "test"
 
 libraryDependencies += "org.slf4j" % "slf4j-nop" % "1.7.23" % "test"
 
