@@ -6,7 +6,7 @@ import akka.NotUsed
 import akka.stream.scaladsl.Flow
 import akka.stream.stage._
 import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
-import com.amazonaws.services.kinesis.AmazonKinesisClient
+import com.amazonaws.services.kinesis.AmazonKinesis
 import com.amazonaws.services.kinesis.model._
 import com.timeout.KinesisGraphStage.PutRecords
 import com.timeout.ToPutRecordsRequest._
@@ -24,7 +24,7 @@ object KinesisGraphStage {
   private[KinesisGraphStage] val sendingThreshold = 250
   private[KinesisGraphStage] val kinesisBackoffTime = 800
 
-  def withClient[A : ToPutRecordsRequest](client: AmazonKinesisClient, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
+  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
     Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
 }
 
