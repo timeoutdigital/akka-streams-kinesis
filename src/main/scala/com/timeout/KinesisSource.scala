@@ -6,10 +6,9 @@ import java.util.Date
 
 import akka.NotUsed
 import akka.stream.scaladsl.Source
+import akka.stream.stage.GraphStageLogic.EagerTerminateOutput
 import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
-import com.amazonaws.AmazonWebServiceRequest
-import com.amazonaws.handlers.AsyncHandler
 import com.amazonaws.regions.Regions
 import com.amazonaws.services.kinesis.model._
 import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
@@ -103,37 +102,8 @@ private[timeout] class KinesisSource(
   val outlet = Outlet[ByteBuffer]("Kinesis Records")
   override def shape = SourceShape[ByteBuffer](outlet)
 
-  override def createLogic(attrs: Attributes) = new GraphStageLogic(shape) with StageLogging {
-
-    /**
-      * Adapt Amazon's 2 argument AsyncHandler based functions to execute a block on completion,
-      * using Akka Streams' threadsafe getAsyncCallback function
-      *
-      * In most case the request argument is the same as the request the AsyncHandler gives you
-      * but describeStreamAsync lets you pass in a string stream name, so we need a different type
-      */
-    private def run[A, Req <: AmazonWebServiceRequest, Resp](
-      requestArgument: A
-    )(
-      amazonAsyncFunction: (A, AsyncHandler[Req, Resp]) => Any
-    )(
-      whenDone: Try[Resp] => Unit
-    ) = {
-      val callback = getAsyncCallback[Try[Resp]](whenDone)
-      val handler = new AsyncHandler[Req, Resp] {
-        override def onError(exception: Exception) = callback.invoke(Failure(exception))
-        override def onSuccess(request: Req, result: Resp) = callback.invoke(Success(result))
-      }
-      amazonAsyncFunction(requestArgument, handler)
-    }
-
-    /**
-      * We don't want to respond to any pull events from downstream
-      * as we're going to push records to them as quickly as we can
-      */
-    setHandler(outlet, new OutHandler {
-      override def onPull() = Unit
-    })
+  override def createLogic(attrs: Attributes) = new GraphStageLogic(shape) with LoggingAwsStage {
+    setHandler(outlet, EagerTerminateOutput)
 
     /**
       * bootstrap everything by getting initial shard iterators

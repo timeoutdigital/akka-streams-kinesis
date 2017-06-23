@@ -1,140 +1,148 @@
 package com.timeout
 
-import java.util.concurrent.Executors
+import java.security.MessageDigest
 
 import akka.NotUsed
-import akka.stream.scaladsl.Flow
+import akka.actor.ActorSystem
+import akka.stream.scaladsl.{Flow, GraphDSL, Merge, Partition}
+import akka.stream.stage.GraphStageLogic.{EagerTerminateOutput, TotallyIgnorantInput}
 import akka.stream.stage._
-import akka.stream.{Attributes, FlowShape, Inlet, Outlet}
-import com.amazonaws.services.kinesis.AmazonKinesis
+import akka.stream._
+import com.amazonaws.services.kinesis.AmazonKinesisAsync
 import com.amazonaws.services.kinesis.model._
-import com.timeout.KinesisGraphStage.PutRecords
 import com.timeout.ToPutRecordsRequest._
 
+import scala.concurrent.duration._
 import scala.collection.JavaConverters._
-import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext
+import scala.util.{Failure, Success}
 
 object KinesisGraphStage {
 
-  type PutRecords = PutRecordsRequest => PutRecordsResult
-  val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
+  private [timeout] val batchSize = 500
 
-  private[KinesisGraphStage] val maxBufferSize = 500 // hard limit imposed by AWS
-  private[KinesisGraphStage] val sendingThreshold = 250
-  private[KinesisGraphStage] val kinesisBackoffTime = 800
+  /**
+    * Given an A determine a partition key (0 to parallelism)
+    * which is used to send it to a particular worker
+    */
+  private def partitionKey[A : ToPutRecordsRequest](parallelism: Int)(r: A): Int = {
+    val hash = MessageDigest.getInstance("MD5").digest(r.toRequestEntry.getPartitionKey.getBytes)
+    BigInt(hash).mod(parallelism).intValue
+  }
 
-  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
-    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
+  /**
+    * Creates a Flow[A, A] for any A that can become a PutRecordsRequest.
+    * The number of concurrent workers is determined by the parallelism,
+    * and records will be distributed amongst the workers by their partition key
+    */
+  def apply[A : ToPutRecordsRequest](
+    kinesis: AmazonKinesisAsync,
+    streamName: String,
+    parallelism: Int
+  )(
+    implicit
+    as: ActorSystem,
+    ec: ExecutionContext
+  ): Flow[A, A, NotUsed] = Flow.fromGraph(
+    GraphDSL.create[FlowShape[A, A]]() { implicit b =>
+      import GraphDSL.Implicits._
+      val split = b.add(Partition[A](parallelism, partitionKey(parallelism)))
+      val merge = b.add(Merge[A](parallelism))
+      (0 until parallelism).foreach { shard =>
+        val stage = new KinesisGraphStage[A](kinesis, streamName, shard)
+        val buffer = Flow[A].buffer(batchSize, OverflowStrategy.backpressure)
+        split.out(shard) ~> buffer ~> stage ~> merge.in(shard)
+      }
+      FlowShape(split.in, merge.out)
+    }
+  )
 }
 
-/**
-  * Asynchronous graph stage for publishing to kinesis
-  * http://doc.akka.io/docs/akka/2.4.12/scala/stream/stream-customize.html
-  * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
-  * The trick is that it then puts any failed items back into the buffer
-  */
-class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String)
-  extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]] {
+private[timeout] class KinesisGraphStage[A : ToPutRecordsRequest](
+  kinesis: AmazonKinesisAsync,
+  streamName: String,
+  worker: Int
+)(
+  implicit
+  as: ActorSystem,
+  ec: ExecutionContext
+) extends GraphStage[FlowShape[A, A]] {
 
   private val in = Inlet[A]("PutRecordsRequestEntry")
-  private val out = Outlet[Either[PutRecordsResultEntry, A]]("PutRecordsResultEntry")
-  override def shape: FlowShape[A, Either[PutRecordsResultEntry, A]] = FlowShape(in, out)
+  private val out = Outlet[A]("PutRecordsResultEntry")
+  override def shape: FlowShape[A, A] = FlowShape(in, out)
 
-  override def createLogic(inheritedAttributes: Attributes) = new GraphStageLogic(shape) with StageLogging {
-
-    import KinesisGraphStage._
-    private var recordsInFlight: Int = 0
-    private val inputBuffer = mutable.Queue.empty[A]
-    private implicit val ec = ExecutionContext.fromExecutor(Executors.newSingleThreadExecutor)
+  override def createLogic(a: Attributes) = new GraphStageLogic(shape) with LoggingAwsStage {
+    setHandler(in, TotallyIgnorantInput)  // upstream finishing is handled in readThenPush
+    setHandler(out, EagerTerminateOutput) // but if downstream stops we might as well too
 
     /**
-      * Respond to any kind of stream event
+      * Given a list of results from kinesis and their corresponding records,
+      * emit all the records which we successfully pushed and retry those that failed
       */
-    private def streamStateChanged(newRecords: List[A] = List.empty) = {
-      inputBuffer.enqueue(newRecords: _*)
-
-      // is the buffer empty and the producer closed? We're done here
-      if (inputBuffer.isEmpty && isClosed(in) && recordsInFlight < 1) {
-        completeStage()
-
-      // is the buffer full? Then lets dispatch the kinesis worker to clear it
-      // otherwise is the producer closed? Then even if the buffer isn't full lets clear it
-      } else if (recordsInFlight < 1 && (inputBuffer.length >= sendingThreshold || isClosed(in))) {
-        pushToKinesis()
-      }
-
-      // is the buffer not full? Lets ask for something new
-      if (!hasBeenPulled(in) && !isClosed(in) && (inputBuffer.length + recordsInFlight) < maxBufferSize) {
-        pull(in)
-      }
+    private def emitThenRead(req: Seq[A], resp: Seq[PutRecordsResultEntry]): Unit = {
+      val (failures, successes) = req.zip(resp).partition { case (_, r) => r.getErrorCode != null }
+      val (toResend, toEmit) = (failures.map(_._1).toList, successes.map(_._1).toList)
+      val wait = (failures.length.toFloat / (failures.length + successes.length)).seconds
+      log.info(s"$worker: ${toEmit.length} successes, ${toResend.length} failures, going again in $wait")
+      emitMultiple(out, toEmit, () => waitThen(wait)(readThenPush(toResend)))
     }
 
     /**
-      * Take everything in inputBuffer and push it to kinesis with kinesisWorkerThread
-      * If we get throughput exceeded issues we will block the kinesis worker for a 800ms
-      * to give it a chance to recover, then put the failed items back onto the buffer
+      * Simply map an A to a PutRecordsRequest
       */
-    def pushToKinesis(): Unit = {
-      val dataToPush = inputBuffer.toList
-      inputBuffer.clear
-      recordsInFlight = dataToPush.size
-
-      Future {
-        // everything in here happens in the worker thread
-        val request = new PutRecordsRequest()
-          .withRecords(dataToPush.map(_.toRequestEntry).asJava)
-          .withStreamName(streamName)
-
-        def incrementalBackoff(err: Throwable, n: Int): Unit = {
-          val waitSec = Math.pow(2, n).toInt
-          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
-          Thread.sleep(waitSec * 1000)
-        }
-
-        val results = withRetries(putRecords(request), onError = incrementalBackoff).getRecords.asScala
-        /*
-         * We rate limit ourselves here in the worker thread
-         * Blocking in getAsyncCallback would block the entire stream
-         * While here the stream can continue to fill any buffers preceding us
-         */
-        val throttled = results.count(_.getErrorCode == ProvisionedThroughputExceededExceptionCode)
-        if (throttled > 0) {
-          Thread.sleep(kinesisBackoffTime)
-        }
-
-        results.zip(dataToPush).toList
-      }.foreach(getAsyncCallback[List[(PutRecordsResultEntry, A)]] { resultsAndRequests =>
-        recordsInFlight = 0
-
-        // in here we're back in an akka streams managed thread
-        val (throughputErrors, otherResults) = resultsAndRequests.partition { case (err, _) =>
-          err.getErrorCode == ProvisionedThroughputExceededExceptionCode
-        }
-
-        log.debug(s"pushed ${otherResults.size}/${resultsAndRequests.size} records to kinesis")
-        val (errors, successes) = otherResults.partition { case (result, _) => result.getErrorCode != null }
-        val results = errors.map(e => Left(e._1)) ++ successes.map(s => Right(s._2))
-        emitMultiple(out, results)
-
-        // put any failures back into the buffer
-        streamStateChanged(throughputErrors.map(_._2))
-      }.invoke(_))
+    private def createRequest(records: Seq[A]): PutRecordsRequest = {
+      val entries = records.map(_.toRequestEntry).asJava
+      new PutRecordsRequest().withRecords(entries).withStreamName(streamName)
     }
 
-    override def beforePreStart() =
-      streamStateChanged()
+    /**
+      * Given a bunch of records, push them to kinesis
+      * and when finished call readThenPush to repeat the process
+      */
+    private def pushToKinesis(records: Seq[A]): Unit =
+      run(createRequest(records))(kinesis.putRecordsAsync) {
+        case Success(result) =>
+          emitThenRead(records, result.getRecords.asScala)
+        case Failure(e) =>
+          log.error(e.getMessage)
+          readThenPush(failures = records)
+      }
 
-    setHandler(in, new InHandler {
-      override def onUpstreamFinish() =
-        streamStateChanged()
-      override def onPush() =
-        streamStateChanged(List(grab(in)))
-    })
+    /**
+      * Wait until we have 100 records, then try to push them to Kinesis.
+      * Whether they succeed or fail, this method will then be called again,
+      * setting up a readThenPush -> pushToKinesis -> emitThenRead -> readThenPush loop
+      */
+    private def readThenPush(failures: Seq[A] = List.empty): Unit = {
+      if (!isClosed(in)) {
+       readN(in, KinesisGraphStage.batchSize - failures.length)(
+        r =>
+          getAsyncCallback[Unit] { _ =>
+            pushToKinesis(failures ++ r)
+          }.invoke(()),
+        r => getAsyncCallback[Unit] { _ =>
+            if ((r ++ failures).isEmpty) {
+              completeStage()
+            } else {
+              pushToKinesis(failures ++ r)
+            }
+          }.invoke(())
+        )
+      } else {
+        completeStage() // todo what if we have failures
+      }
 
-    setHandler(out, new OutHandler {
-      override def onPull() =
-        streamStateChanged(List.empty)
-    })
+    }
+
+
+    /**
+      * Before we start we need to kick off the read -> push loops mentioned above.
+      * We kick off the same number of loops as there are shards in the stream
+      */
+    override def preStart() = {
+      log.info(s"Pushing to $streamName")
+      readThenPush()
+    }
   }
 }
