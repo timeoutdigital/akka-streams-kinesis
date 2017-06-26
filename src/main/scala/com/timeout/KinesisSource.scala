@@ -6,6 +6,7 @@ import java.util.Date
 
 import akka.NotUsed
 import akka.stream.scaladsl.Source
+import akka.stream.stage.GraphStageLogic.EagerTerminateOutput
 import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
 import com.amazonaws.AmazonServiceException.ErrorType
@@ -124,6 +125,7 @@ private[timeout] class KinesisSource(
   override def shape = SourceShape[ByteBuffer](outlet)
 
   override def createLogic(attrs: Attributes) = new GraphStageLogic(shape) with StageLogging {
+    setHandler(outlet, EagerTerminateOutput)
 
     /**
       * Adapt Amazon's 2 argument AsyncHandler based functions to execute a block on completion,
@@ -147,15 +149,6 @@ private[timeout] class KinesisSource(
       amazonAsyncFunction(requestArgument, handler)
     }
 
-    /**
-      * We don't want to respond to any pull events from downstream
-      * as we're going to push records to them as quickly as we can
-      */
-    setHandler(outlet, new OutHandler {
-      override def onPull() = Unit
-    })
-
-
     private def beginReadingFromShards(shards: List[Shard]): Unit =
       shardIteratorRequests(iterator, shards, streamName).foreach { case (shard, request) =>
         run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
@@ -172,8 +165,13 @@ private[timeout] class KinesisSource(
       * bootstrap everything by getting initial shard iterators
       * Any errors here are essentially unrecoverable so we explode, hence the .gets
       */
-    run(streamName)(kinesis.describeStreamAsync) { stream =>
-      beginReadingFromShards(Shard.fromAws(stream.get.getStreamDescription.getShards.asScala.toList))
+    override def preStart() = {
+      run(streamName)(kinesis.describeStreamAsync) { stream =>
+        val awsShards = stream.get.getStreamDescription.getShards.asScala.toList
+        val shards = Shard.fromAws(awsShards)
+        log.debug(s"Found shards: $shards")
+        beginReadingFromShards(shards)
+      }
     }
 
     /**

@@ -56,5 +56,16 @@ class ShardTest extends FreeSpec with Matchers {
         ))
       )
     }
+
+    "Handle the situation where the parent streams have gone" in {
+      val shards = List(
+         new AwsShard().withShardId("foo1-child1").withParentShardId("foo1"),
+         new AwsShard().withShardId("foo1-child2").withParentShardId("foo1")
+      )
+      Shard.fromAws(shards) shouldEqual List(
+        Shard("foo1-child1", List.empty),
+        Shard("foo1-child2", List.empty)
+      )
+    }
   }
 }
