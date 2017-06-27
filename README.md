@@ -12,7 +12,7 @@ Add the following to your `build.sbt`:
 
 ```scala
 resolvers += Resolver.bintrayRepo("timeoutdigital", "releases")
-libraryDependencies += "com.timeout" %% "akka-streams-kinesis" % "0.2.2"
+libraryDependencies += "com.timeout" %% "akka-streams-kinesis" % "0.2.4"
 ```
 
 ## Reading from Kinesis
