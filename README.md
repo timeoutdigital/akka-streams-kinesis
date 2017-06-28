@@ -17,19 +17,28 @@ libraryDependencies += "com.timeout" %% "akka-streams-kinesis" % "0.2.4"
 
 ## Reading from Kinesis
 
-You can read from Kinesis with `KinesisSource`, which uses the `AmazonKinesisAsync` client internally. 
+You can read from Kinesis with `KinesisSource`
 
 ```scala
+import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder
+import com.timeout.KinesisSource.IteratorType.AtTimestamp
 import com.timeout.KinesisSource
 import java.time.ZonedDateTime
 
+val kinesis = AmazonKinesisAsyncClientBuilder.standard.build //etc
 val since = ZonedDateTime.now // from when to start reading the stream
-val stage = KinesisSource("my-stream-name", since = since)
+val stage = KinesisSource(kinesis, "my-stream-name", iterator = AtTimestamp(since))
 ```
 
+👍 Currently supported:
+
+ - `AT_TIMESTAMP`, `LATEST` & `TRIM_HORIZON` shard iterators
+ - Reading from many shards (in an undefined order)
+ - Arbitrary amounts of backpressure
+ 
 ⚠️ Currently not supported:
 
- - Shard iterator types other than `AT_TIMESTAMP`
+ - `AT_SEQUENCE_NUMBER` or `AFTER_SEQUENCE_NUMBER` shard iterators
  - [Resharding of the stream](http://docs.aws.amazon.com/streams/latest/dev/kinesis-using-sdk-java-resharding.html)
  
 ## Writing to Kinesis
@@ -43,7 +52,7 @@ Here's an example of how to write a Stream of `String`s to Kinesis:
 ```scala
 import java.nio.ByteBuffer
 
-import com.amazonaws.services.kinesis.AmazonKinesisAsyncClient
+import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder
 import com.timeout.{KinesisGraphStage, ToPutRecordsRequest}
 import com.amazonaws.services.kinesis.model.PutRecordsRequestEntry
 
@@ -51,7 +60,7 @@ implicit val instance = ToPutRecordsRequest.instance[String] { str =>
   new PutRecordsRequestEntry().withData(ByteBuffer.wrap(str.getBytes))
 }
 
-val kinesis = new AmazonKinesisAsyncClient()
+val kinesis = AmazonKinesisAsyncClientBuilder.standard.build //etc
 val stage = KinesisGraphStage.withClient[String](kinesis, "my-stream")
 // stage: Flow[String, Either[PutRecordsResultEntry,String], NotUsed]
 ```
