@@ -10,9 +10,9 @@ import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
 import com.amazonaws.AmazonWebServiceRequest
 import com.amazonaws.handlers.AsyncHandler
-import com.amazonaws.regions.Regions
 import com.amazonaws.services.kinesis.model._
-import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
+import com.amazonaws.services.kinesis.AmazonKinesisAsync
+import com.timeout.KinesisSource.IteratorType
 
 import scala.collection.JavaConverters._
 import scala.concurrent.ExecutionContext
@@ -20,14 +20,23 @@ import scala.util.{Failure, Success, Try}
 
 object KinesisSource {
 
-  private [timeout] val region: Regions =
-    Option(Regions.getCurrentRegion)
-      .map(r => Regions.fromName(r.getName))
-      .getOrElse(Regions.EU_WEST_1)
+  /**
+    * Models the ShardIteratorType parameter passed to GetShardIterator
+    * http://docs.aws.amazon.com/kinesis/latest/APIReference/API_GetShardIterator.html
+    * We don't support sequence number based iterators yet as the source does not emit sequence numbers
+    */
+  sealed trait IteratorType
 
-  private[timeout] lazy val kinesis: AmazonKinesisAsync =
-    AmazonKinesisAsyncClientBuilder.standard.withRegion(region).build
+  object IteratorType {
+    case class AtTimestamp(time: ZonedDateTime) extends IteratorType
+    case object TrimHorizon extends IteratorType
+    case object Latest extends IteratorType
+  }
 
+  /**
+    * A wrapper for a Kinesis shard iterator, that knows how to reissue itself
+    * should it expire due to the 5 minute iterator validity cutoff
+    */
   private [timeout] case class ShardIterator(
     iterator: String,
     reissue: GetShardIteratorRequest
@@ -56,46 +65,53 @@ object KinesisSource {
     * It is serialisation format agnostic so emits a stream of ByteBuffers
     */
   def apply(
+    kinesis: AmazonKinesisAsync,
     stream: String,
-    since: ZonedDateTime
+    iterator: IteratorType
   )(
     implicit
-    ec: ExecutionContext,
     clock: Clock = Clock.systemUTC
   ): Source[ByteBuffer, NotUsed] =
-    Source.fromGraph(new KinesisSource(stream, since))
+    Source.fromGraph(new KinesisSource(kinesis, stream, iterator))
 
   /**
     * Construct shard iterator requests
     * based on a stream description
     */
   private[timeout] def shardIteratorRequests(
-    since: ZonedDateTime,
+    iteratorType: IteratorType,
     stream: StreamDescription
   )(
     implicit
     clock: Clock
   ): List[GetShardIteratorRequest] =
     stream.getShards.asScala.toList.map { shard =>
-    val now = clock.instant
-    val readFrom = if (since.toInstant.isBefore(now)) since.toInstant else now
-    new GetShardIteratorRequest()
-      .withShardIteratorType("AT_TIMESTAMP")
-      .withTimestamp(Date.from(readFrom))
-      .withStreamName(stream.getStreamName)
-      .withShardId(shard.getShardId)
-  }
+      val request = new GetShardIteratorRequest()
+        .withStreamName(stream.getStreamName)
+        .withShardId(shard.getShardId)
+
+      iteratorType match {
+        case IteratorType.AtTimestamp(since) =>
+          val now = ZonedDateTime.now(clock)
+          val readFrom = if (since.isBefore(now)) since else now
+          request.withShardIteratorType("AT_TIMESTAMP").withTimestamp(Date.from(readFrom.toInstant))
+        case IteratorType.TrimHorizon =>
+          request.withShardIteratorType("TRIM_HORIZON")
+        case IteratorType.Latest =>
+          request.withShardIteratorType("LATEST")
+      }
+    }
 }
 
 /**
   * A source for kinesis records
   */
 private[timeout] class KinesisSource(
+  kinesis: AmazonKinesisAsync,
   streamName: String,
-  since: ZonedDateTime
+  iterator: IteratorType
 )(
   implicit
-  e: ExecutionContext,
   clock: Clock
 ) extends GraphStage[SourceShape[ByteBuffer]] {
 
@@ -140,7 +156,7 @@ private[timeout] class KinesisSource(
       * Any errors here are essentially unrecoverable so we explode, hence the .gets
       */
     run(streamName)(kinesis.describeStreamAsync) { stream =>
-      shardIteratorRequests(since, stream.get.getStreamDescription).foreach { request =>
+      shardIteratorRequests(iterator, stream.get.getStreamDescription).foreach { request =>
         run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
           getRecords(ShardIterator(iteratorResult.get.getShardIterator, request))
         }
