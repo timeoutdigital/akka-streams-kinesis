@@ -4,6 +4,7 @@ cache:
   directories:
     - $HOME/.ivy2/cache
     - $HOME/.sbt/boot/
+    - node_modules
 
 scala:
   - 2.11.8
@@ -11,6 +12,9 @@ scala:
 
 jdk:
   - oraclejdk8
+
+before_script:
+  - npm install -g kinesalite
 
 script:
   - sbt ++$TRAVIS_SCALA_VERSION test
