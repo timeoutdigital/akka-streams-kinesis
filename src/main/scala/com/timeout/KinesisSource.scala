@@ -70,7 +70,6 @@ object KinesisSource {
     iterator: IteratorType
   )(
     implicit
-    ec: ExecutionContext,
     clock: Clock = Clock.systemUTC
   ): Source[ByteBuffer, NotUsed] =
     Source.fromGraph(new KinesisSource(kinesis, stream, iterator))
@@ -113,7 +112,6 @@ private[timeout] class KinesisSource(
   iterator: IteratorType
 )(
   implicit
-  e: ExecutionContext,
   clock: Clock
 ) extends GraphStage[SourceShape[ByteBuffer]] {
 
