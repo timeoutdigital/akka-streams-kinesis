@@ -13,7 +13,6 @@ import org.scalatest.{FreeSpec, Matchers}
 
 import scala.collection.JavaConverters._
 import scala.concurrent.duration._
-import scala.util.Try
 
 class KinesisSourceTest extends
   FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
