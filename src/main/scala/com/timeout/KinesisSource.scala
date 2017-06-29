@@ -17,7 +17,6 @@ import com.amazonaws.services.kinesis.AmazonKinesisAsync
 import com.timeout.KinesisSource.IteratorType
 
 import scala.collection.JavaConverters._
-import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success, Try}
 
 object KinesisSource {
@@ -161,18 +160,29 @@ private[timeout] class KinesisSource(
         }
       }
 
+    private def discoverShards(parent: Option[Shard]): Unit = {
+      run(streamName)(kinesis.describeStreamAsync) { stream =>
+        val awsShards = stream.get.getStreamDescription.getShards.asScala.toList
+        val parentIdOrNull = parent.map(_.id).orNull
+
+        val filtered = awsShards.filter { s =>
+          s.getParentShardId == parentIdOrNull ||
+          s.getAdjacentParentShardId == parentIdOrNull
+        }
+
+        val shards = Shard.fromAws(filtered)
+        val logText = parent.fold("top level shards")(p => s"children of ${p.id}")
+        log.debug(s"Found ${shards.length} $logText")
+        beginReadingFromShards(shards)
+      }
+    }
+
     /**
       * bootstrap everything by getting initial shard iterators
       * Any errors here are essentially unrecoverable so we explode, hence the .gets
       */
-    override def preStart() = {
-      run(streamName)(kinesis.describeStreamAsync) { stream =>
-        val awsShards = stream.get.getStreamDescription.getShards.asScala.toList
-        val shards = Shard.fromAws(awsShards)
-        log.debug(s"Found shards: $shards")
-        beginReadingFromShards(shards)
-      }
-    }
+    override def preStart() =
+      discoverShards(parent = None)
 
     /**
       * Get records from Kinesis, then call handleResult
@@ -192,9 +202,11 @@ private[timeout] class KinesisSource(
       emitMultiple[ByteBuffer](outlet, result.getRecords.asScala.map(_.getData).toList, { () =>
         Option(result.getNextShardIterator).fold {
           log.debug(s"${currentIterator.shard.id} has been closed")
-          beginReadingFromShards(currentIterator.shard.children)
+          discoverShards(Some(currentIterator.shard))
         } { _ =>
-          getRecords(nextIterator(currentIterator, result))
+          val next = nextIterator(currentIterator, result)
+          if (next.iterator == currentIterator.iterator) log.error("?")
+          getRecords(next)
         }
       })
     }

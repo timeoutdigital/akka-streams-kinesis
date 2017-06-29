@@ -4,15 +4,16 @@ import java.nio.ByteBuffer
 import java.time.{Clock, ZonedDateTime}
 import java.util.Date
 
+import akka.stream.ThrottleMode
 import akka.stream.scaladsl.Sink
-import com.amazonaws.services.kinesis.model.{Shard, StreamDescription, UpdateShardCountRequest}
 import com.timeout.KinesisSource.IteratorType
 import com.timeout.KinesisSource.IteratorType.TrimHorizon
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.{FreeSpec, Matchers}
-import scala.collection.JavaConverters._
 
+import scala.collection.JavaConverters._
 import scala.concurrent.duration._
+import scala.util.Try
 
 class KinesisSourceTest extends
   FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
@@ -21,7 +22,7 @@ class KinesisSourceTest extends
   implicit val clock = Clock.fixed(now.toInstant, now.getZone)
   override implicit val patienceConfig = PatienceConfig(30.seconds, 100.millis)
 
-  val stream="test"
+  val stream = "test"
   val shards = List(
      Shard("1234", List.empty),
      Shard("2345", List.empty)
@@ -73,7 +74,7 @@ class KinesisSourceTest extends
     "Should work with a stream that has recently been resharded" in {
 
       val beforeReshard = List(1 -> "a", 2 -> "b", 3 -> "c")
-      val afterReshard = (1 to 1000).map(1 -> _.toString).toList
+      val afterReshard = (1 to 100).map(1 -> _.toString).toList
       pushToStream(beforeReshard)
 
       kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
@@ -83,8 +84,30 @@ class KinesisSourceTest extends
       }
 
       pushToStream(afterReshard)
-      whenReady(KinesisSource(kinesis, streamName, TrimHorizon).take(1003).runWith(Sink.seq[ByteBuffer])) { r =>
+      whenReady(KinesisSource(kinesis, streamName, TrimHorizon).take(beforeReshard.length + afterReshard.length).runWith(Sink.seq[ByteBuffer])) { r =>
         r.map(b => new String(b.array)).toSet shouldEqual (beforeReshard.toSet ++ afterReshard.toSet).map(_._2)
+      }
+    }
+
+    "Should work with a stream that is resharded while the source is reading" in {
+      val beforeReshard = List(1 -> "a", 2 -> "b", 3 -> "c")
+      val afterReshard = (1 to 10).map(1 -> _.toString).toList
+      val stream = KinesisSource(kinesis, streamName, TrimHorizon)
+        .throttle(1, 1.second, 1, ThrottleMode.shaping) // https://github.com/mhart/kinesalite/pull/36
+        .take(beforeReshard.length + afterReshard.length)
+        .runWith(Sink.seq[ByteBuffer])
+      pushToStream(beforeReshard)
+
+      kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
+        val hashKey = (BigInt(shard.getHashKeyRange.getStartingHashKey) + 50).toString
+        kinesis.splitShard(streamName, shard.getShardId, hashKey)
+        Thread.sleep(600)
+      }
+
+      pushToStream(afterReshard)
+      whenReady(stream) { r =>
+        val recordSet = r.map(b => new String(b.array)).toSet
+        recordSet shouldEqual (beforeReshard.toSet ++ afterReshard.toSet).map(_._2)
       }
     }
   }

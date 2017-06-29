@@ -5,8 +5,8 @@ import java.nio.ByteBuffer
 
 import akka.Done
 import akka.stream.scaladsl.{Sink, Source}
-import com.amazonaws.{ClientConfiguration, ClientConfigurationFactory, SDKGlobalConfiguration}
-import com.amazonaws.auth.{AWSCredentials, AWSStaticCredentialsProvider, BasicAWSCredentials}
+import com.amazonaws.SDKGlobalConfiguration
+import com.amazonaws.auth.{AWSStaticCredentialsProvider, BasicAWSCredentials}
 import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration
 import com.amazonaws.services.kinesis.model.PutRecordsRequestEntry
 import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
