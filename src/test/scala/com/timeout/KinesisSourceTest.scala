@@ -1,17 +1,18 @@
 package com.timeout
 
-import java.nio.ByteBuffer
 import java.time.{Clock, ZonedDateTime}
 import java.util.Date
 
 import akka.stream.ThrottleMode
 import akka.stream.scaladsl.Sink
-import com.timeout.KinesisSource.IteratorType
+import com.amazonaws.services.kinesis.model.{DescribeStreamResult, Shard, StreamDescription}
+import com.timeout.KinesisSource.{IteratorType, ShardId}
 import com.timeout.KinesisSource.IteratorType.TrimHorizon
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.{FreeSpec, Matchers}
 
 import scala.collection.JavaConverters._
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
 class KinesisSourceTest extends
@@ -19,15 +20,15 @@ class KinesisSourceTest extends
 
   val now = ZonedDateTime.parse("2017-01-01T07:00:00Z")
   implicit val clock = Clock.fixed(now.toInstant, now.getZone)
-  override implicit val patienceConfig = PatienceConfig(30.seconds, 100.millis)
+  override implicit val patienceConfig = PatienceConfig(40.seconds, 100.millis)
 
   val stream = "test"
   val shards = List(
-     Shard("1234", List.empty),
-     Shard("2345", List.empty)
+     ShardId("1234"),
+     ShardId("2345")
   )
 
-  "Kinesis Source" - {
+  "shardIteratorRequests function" - {
 
     "Should generate one AT_TIMESTAMP iterator request per shard" in {
       val requests = KinesisSource.shardIteratorRequests(IteratorType.AtTimestamp(now), shards, stream)
@@ -62,18 +63,18 @@ class KinesisSourceTest extends
 
       val results = for {
         _ <- pushToStream(shardsToRecords)
-        records <- KinesisSource(kinesis, streamName, TrimHorizon).take(4).runWith(Sink.seq)
+        records <- readN(4)
       } yield records.toList
 
       whenReady(results) { records =>
-        records.map(b => new String(b.array)) shouldEqual shardsToRecords.map(_._2)
+        records shouldEqual shardsToRecords.map(_._2)
       }
     }
 
     "Should work with a stream that has recently been resharded" in {
 
       val beforeReshard = List(1 -> "a", 2 -> "b", 3 -> "c")
-      val afterReshard = (1 to 100).map(1 -> _.toString).toList
+      val afterReshard = (1 to 5).map(1 -> _.toString).toList
       pushToStream(beforeReshard)
 
       kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
@@ -83,18 +84,95 @@ class KinesisSourceTest extends
       }
 
       pushToStream(afterReshard)
-      whenReady(KinesisSource(kinesis, streamName, TrimHorizon).take(beforeReshard.length + afterReshard.length).runWith(Sink.seq[ByteBuffer])) { r =>
-        r.map(b => new String(b.array)).toSet shouldEqual (beforeReshard.toSet ++ afterReshard.toSet).map(_._2)
+      whenReady(readN(beforeReshard.length + afterReshard.length)) { r =>
+        r.sorted shouldEqual (beforeReshard ++ afterReshard).sorted.map(_._2)
       }
     }
+  }
+
+  "createShards function" - {
+
+    "Should find top level shards of a stream which hasn't been resharded" in {
+      val desc = new StreamDescription().withShards(
+        new Shard().withShardId("1234"),
+        new Shard().withShardId("2345")
+      )
+
+      val stream = new DescribeStreamResult()
+        .withStreamDescription(desc)
+
+      val result = KinesisSource.findOldestPossibleShards(stream)
+      result shouldEqual List(ShardId("1234"), ShardId("2345"))
+    }
+
+    "Should find child shards if a parent shard ID is passed in" in {
+      val desc = new StreamDescription().withShards(
+        // we want to find 1234 as its parent is the shard we want
+        new Shard().withShardId("1234").withParentShardId("123"),
+
+        // 2345 is an adjacent child of 123 which we want to ignore
+        new Shard().withShardId("2345").withAdjacentParentShardId("123"),
+
+        // 3456 is not a child shard so we want to ignore
+        new Shard().withShardId("3456")
+      )
+
+      val stream = new DescribeStreamResult()
+        .withStreamDescription(desc)
+
+      val result = KinesisSource.findChildShards(stream, parent = ShardId("123"))
+      result shouldEqual List(ShardId("1234"))
+    }
+
+    "Should consider orphan child shards to be parents" in {
+      /*
+       * long after a stream is resharded the child shards produced
+       * still reference their parent shards, even though they're expired
+       * so if we get a child shard pointing to a non existent parent
+       * we want to consider it to be a top level parent shard
+       */
+      val desc = new StreamDescription().withShards(
+        new Shard().withShardId("1234").withParentShardId("123"),
+        new Shard().withShardId("3456")
+      )
+
+      val stream = new DescribeStreamResult()
+        .withStreamDescription(desc)
+
+      val result = KinesisSource.findOldestPossibleShards(stream)
+      result shouldEqual List(ShardId("1234"), ShardId("3456"))
+    }
+
+    "Should exclude shards which have been resharded when finding the newest possible shards" in {
+      val desc = new StreamDescription().withShards(
+
+        // been resharded, we don't want
+        new Shard().withShardId("123"),
+
+        // this is a descendant of the above, so we do want
+        new Shard().withShardId("1234").withParentShardId("123"),
+
+        // has a non existent parent so we also want
+        new Shard().withShardId("1235").withParentShardId("12"),
+
+        //top level but not resharded so we do want
+        new Shard().withShardId("2345")
+      )
+
+      val stream = new DescribeStreamResult()
+        .withStreamDescription(desc)
+
+      val result = KinesisSource.findNewestPossibleShards(stream)
+      result shouldEqual List(ShardId("1234"), ShardId("1235"), ShardId("2345"))
+    }
+  }
+
+  "Kinesis Source with kinesalite" - {
 
     "Should work with a stream that is resharded while the source is reading" in {
       val beforeReshard = List(1 -> "a", 2 -> "b", 3 -> "c")
-      val afterReshard = (1 to 10).map(1 -> _.toString).toList
-      val stream = KinesisSource(kinesis, streamName, TrimHorizon)
-        .throttle(1, 1.second, 1, ThrottleMode.shaping) // https://github.com/mhart/kinesalite/pull/36
-        .take(beforeReshard.length + afterReshard.length)
-        .runWith(Sink.seq[ByteBuffer])
+      val afterReshard = (1 to 5).map(1 -> _.toString).toList
+      val stream = readN(beforeReshard.length + afterReshard.length)
       pushToStream(beforeReshard)
 
       kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
@@ -105,9 +183,34 @@ class KinesisSourceTest extends
 
       pushToStream(afterReshard)
       whenReady(stream) { r =>
-        val recordSet = r.map(b => new String(b.array)).toSet
-        recordSet shouldEqual (beforeReshard.toSet ++ afterReshard.toSet).map(_._2)
+        r.sorted shouldEqual (beforeReshard ++ afterReshard).sorted.map(_._2)
+      }
+    }
+
+    "Should work with a stream whose shards are merged" in {
+      val beforeReshard = List(1 -> "a", 2 -> "b", 3 -> "c")
+      val afterReshard = (1 to 5).map(1 -> _.toString).toList
+      val stream = readN(beforeReshard.length + afterReshard.length)
+      pushToStream(beforeReshard)
+
+      val shards = kinesis.describeStream(streamName).getStreamDescription.getShards.asScala
+      kinesis.mergeShards(streamName, shards.head.getShardId, shards(1).getShardId)
+      Thread.sleep(600)
+
+      pushToStream(afterReshard)
+      whenReady(stream) { r =>
+        r.sorted shouldEqual (beforeReshard ++ afterReshard).sorted.map(_._2)
       }
     }
   }
+
+  /**
+    * Read a certain number of records from Kinesis
+    */
+  private def readN(number: Int): Future[Seq[String]] =
+    KinesisSource(kinesis, streamName, TrimHorizon)
+      .throttle(1, 2.second, 1, ThrottleMode.shaping) // https://github.com/mhart/kinesalite/pull/36
+      .map(b => new String(b.array))
+      .groupedWithin(number * 2, (number * 2).seconds)
+      .runWith(Sink.head)
 }
