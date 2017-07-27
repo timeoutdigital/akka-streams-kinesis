@@ -145,25 +145,22 @@ class KinesisSourceTest extends
 
     "Should exclude shards which have been resharded when finding the newest possible shards" in {
       val desc = new StreamDescription().withShards(
+        // we start with one shard
+        new Shard().withShardId("1"),
 
-        // been resharded, we don't want
-        new Shard().withShardId("123"),
+        // we then reshard to split that one shard into two
+        new Shard().withShardId("2").withParentShardId("1"),
+        new Shard().withShardId("3").withParentShardId("1"),
 
-        // this is a descendant of the above, so we do want
-        new Shard().withShardId("1234").withParentShardId("123"),
-
-        // has a non existent parent so we also want
-        new Shard().withShardId("1235").withParentShardId("12"),
-
-        //top level but not resharded so we do want
-        new Shard().withShardId("2345")
+        // finally we reshard back to one shard, so merge both shards back into one
+        new Shard().withShardId("4").withParentShardId("2").withAdjacentParentShardId("3")
       )
 
       val stream = new DescribeStreamResult()
         .withStreamDescription(desc)
 
       val result = KinesisSource.findNewestPossibleShards(stream)
-      result shouldEqual List(ShardId("1234"), ShardId("1235"), ShardId("2345"))
+      result shouldEqual List(ShardId("4"))
     }
   }
 

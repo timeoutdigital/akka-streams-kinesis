@@ -132,9 +132,9 @@ object KinesisSource {
     stream: DescribeStreamResult
   ) = {
     val awsShards = stream.getStreamDescription.getShards.asScala.toList
-    val parentShardIds: List[String] = awsShards.flatMap { s =>
-      Option(s.getParentShardId).orElse(Option(s.getAdjacentParentShardId))
-    }
+    val parentShardIds: Set[String] = awsShards.flatMap { s =>
+      Option(s.getParentShardId) ++ Option(s.getAdjacentParentShardId)
+    }.toSet
     awsShards
       .filterNot(s => parentShardIds.contains(s.getShardId))
       .map(s => ShardId(s.getShardId))
