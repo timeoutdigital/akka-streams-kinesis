@@ -19,7 +19,7 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
 
   val now = ZonedDateTime.parse("2017-01-01T07:00:00Z")
   implicit val clock = Clock.fixed(now.toInstant, now.getZone)
-  override implicit val patienceConfig = PatienceConfig(40.seconds, 100.millis)
+  override implicit val patienceConfig = PatienceConfig(60.seconds, 100.millis)
 
   val stream = "test"
   val shards = List(
@@ -218,6 +218,7 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
       splitShards()
       val latestShardContents = (1 to 8).map(i => i -> List.fill(i)("c").mkString).toList
       val reading = readN(number = 8, it = Latest)
+      Thread.sleep(500) // wait for describeStream etc to finish
       pushToStream(latestShardContents)
       whenReady(reading) { data =>
         data.sorted shouldEqual latestShardContents.map(_._2)
