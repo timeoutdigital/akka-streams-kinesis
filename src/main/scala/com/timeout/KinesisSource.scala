@@ -152,6 +152,15 @@ object KinesisSource {
       case s if s.getParentShardId == parent.value => ShardId(s.getShardId)
     }
   }
+
+  /**
+    * when we're reading LATEST and need to begin reading from a new shard we want to TRIM_HORIZON it
+    * just to ensure we don't miss any records added during our describe stream call
+    */
+  private [timeout] def iteratorForReshard(iterator: IteratorType) = iterator match {
+    case IteratorType.Latest => IteratorType.TrimHorizon
+    case it => it
+  }
 }
 
 /**
@@ -206,7 +215,7 @@ private[timeout] class KinesisSource(
             log.warning(s"$streamName: No iterator for $shard")
             handleReshard(shard)
           } { it =>
-            log.debug(s"$streamName: Beginning to read from ${shard.value}")
+            log.debug(s"$streamName: Beginning to read from ${shard.value} at $iteratorType")
             getRecords(ShardIterator(shard, it, request))
           }
         }
@@ -220,12 +229,7 @@ private[timeout] class KinesisSource(
     private def handleReshard(closedShard: ShardId): Unit = {
       run(streamName)(kinesis.describeStreamAsync) { stream =>
         val shards: List[ShardId] = findChildShards(stream.get, closedShard)
-
-        val newIterator = iterator match {
-          case IteratorType.Latest => IteratorType.TrimHorizon
-          case it => it
-        }
-
+        val newIterator = iteratorForReshard(iterator)
         beginReadingFromShards(shards, newIterator)
       }
     }

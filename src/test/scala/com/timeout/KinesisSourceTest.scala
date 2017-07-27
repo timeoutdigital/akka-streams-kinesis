@@ -7,7 +7,7 @@ import akka.stream.ThrottleMode
 import akka.stream.scaladsl.Sink
 import com.amazonaws.services.kinesis.model.{DescribeStreamResult, Shard, StreamDescription}
 import com.timeout.KinesisSource.{IteratorType, ShardId}
-import com.timeout.KinesisSource.IteratorType.TrimHorizon
+import com.timeout.KinesisSource.IteratorType.{Latest, TrimHorizon}
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.{FreeSpec, Matchers}
 
@@ -15,8 +15,7 @@ import scala.collection.JavaConverters._
 import scala.concurrent.Future
 import scala.concurrent.duration._
 
-class KinesisSourceTest extends
-  FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
+class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
 
   val now = ZonedDateTime.parse("2017-01-01T07:00:00Z")
   implicit val clock = Clock.fixed(now.toInstant, now.getZone)
@@ -87,6 +86,18 @@ class KinesisSourceTest extends
       whenReady(readN(beforeReshard.length + afterReshard.length)) { r =>
         r.sorted shouldEqual (beforeReshard ++ afterReshard).sorted.map(_._2)
       }
+    }
+  }
+
+  "iteratorForReshard function" - {
+
+    "Should turn LATEST iterators into TRIM_HORIZON for newly created shards" in {
+      KinesisSource.iteratorForReshard(IteratorType.Latest) shouldEqual IteratorType.TrimHorizon
+    }
+
+    "Should pass through other iterator types unchanged" in {
+      KinesisSource.iteratorForReshard(IteratorType.AtTimestamp(now)) shouldEqual IteratorType.AtTimestamp(now)
+      KinesisSource.iteratorForReshard(IteratorType.TrimHorizon) shouldEqual IteratorType.TrimHorizon
     }
   }
 
@@ -171,12 +182,7 @@ class KinesisSourceTest extends
       val afterReshard = (1 to 5).map(1 -> _.toString).toList
       val stream = readN(beforeReshard.length + afterReshard.length)
       pushToStream(beforeReshard)
-
-      kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
-        val hashKey = (BigInt(shard.getHashKeyRange.getStartingHashKey) + 50).toString
-        kinesis.splitShard(streamName, shard.getShardId, hashKey)
-        Thread.sleep(600)
-      }
+      splitShards()
 
       pushToStream(afterReshard)
       whenReady(stream) { r =>
@@ -199,13 +205,31 @@ class KinesisSourceTest extends
         r.sorted shouldEqual (beforeReshard ++ afterReshard).sorted.map(_._2)
       }
     }
+
+    "Should only get records from the latest shards when reading LATEST" in {
+      /*
+       * We do two reshards because any detected reshards when reading LATEST
+       * will begin reading the new shards from TRIM_HORIZON, so if we get any info from the first two shard sets
+       * we know that getNewestPossibleShards isn't working too well
+       */
+      pushToStream(List(1 -> "a", 2 -> "aa"))
+      splitShards()
+      pushToStream(List(1 -> "b", 2 -> "bb", 3 -> "bbb", 4 -> "bbbb"))
+      splitShards()
+      val latestShardContents = (1 to 8).map(i => i -> List.fill(i)("c").mkString).toList
+      val reading = readN(number = 8, it = Latest)
+      pushToStream(latestShardContents)
+      whenReady(reading) { data =>
+        data.sorted shouldEqual latestShardContents.map(_._2)
+      }
+    }
   }
 
   /**
     * Read a certain number of records from Kinesis
     */
-  private def readN(number: Int): Future[Seq[String]] =
-    KinesisSource(kinesis, streamName, TrimHorizon)
+  private def readN(number: Int, it: IteratorType = TrimHorizon): Future[Seq[String]] =
+    KinesisSource(kinesis, streamName, it)
       .throttle(1, 2.second, 1, ThrottleMode.shaping) // https://github.com/mhart/kinesalite/pull/36
       .map(b => new String(b.array))
       .groupedWithin(number * 2, (number * 2).seconds)

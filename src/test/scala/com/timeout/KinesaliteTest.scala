@@ -11,7 +11,7 @@ import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration
 import com.amazonaws.services.kinesis.model.PutRecordsRequestEntry
 import com.amazonaws.services.kinesis.{AmazonKinesisAsync, AmazonKinesisAsyncClientBuilder}
 import org.scalatest.{BeforeAndAfterEach, Suite}
-
+import scala.collection.JavaConverters._
 import scala.concurrent.Future
 import scala.sys.process._
 
@@ -29,7 +29,7 @@ trait KinesaliteTest extends AkkaStreamsTest with BeforeAndAfterEach { self: Sui
 
     val output = new ByteArrayOutputStream
     assume(("which kinesalite" #> output).! == 0, "Kinesalite is installed")
-    kinesalite = s"kinesalite --port $kinesalitePort".run
+    kinesalite = s"kinesalite --port $kinesalitePort --shardLimit 64".run
 
     val endpoint = new EndpointConfiguration(s"http://localhost:$kinesalitePort", "eu-west-1")
     val credentials = new AWSStaticCredentialsProvider(new BasicAWSCredentials("", ""))
@@ -65,5 +65,15 @@ trait KinesaliteTest extends AkkaStreamsTest with BeforeAndAfterEach { self: Sui
     Source(records)
       .via(KinesisGraphStage.withClient[(Int, String)](kinesis, streamName))
       .runWith(Sink.ignore)
+  }
+
+  protected def splitShards(): Unit = {
+    kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
+      val startingKey = BigInt(shard.getHashKeyRange.getStartingHashKey)
+      val endingKey = BigInt(shard.getHashKeyRange.getEndingHashKey)
+      val hashKey = startingKey + ((endingKey - startingKey) / 2)
+      kinesis.splitShard(streamName, shard.getShardId, hashKey.toString)
+      Thread.sleep(600)
+    }
   }
 }
