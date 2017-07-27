@@ -68,11 +68,14 @@ trait KinesaliteTest extends AkkaStreamsTest with BeforeAndAfterEach { self: Sui
   }
 
   protected def splitShards(): Unit = {
-    kinesis.describeStream(streamName).getStreamDescription.getShards.asScala.foreach { shard =>
+    val describeStreamResult = kinesis.describeStream(streamName)
+    val byId = describeStreamResult.getStreamDescription.getShards.asScala.map(s => s.getShardId -> s).toMap
+    KinesisSource.findNewestPossibleShards(describeStreamResult).foreach { shardId =>
+      val shard = byId(shardId.value)
       val startingKey = BigInt(shard.getHashKeyRange.getStartingHashKey)
       val endingKey = BigInt(shard.getHashKeyRange.getEndingHashKey)
       val hashKey = startingKey + ((endingKey - startingKey) / 2)
-      kinesis.splitShard(streamName, shard.getShardId, hashKey.toString)
+      kinesis.splitShard(streamName, shardId.value, hashKey.toString)
       Thread.sleep(600)
     }
   }
