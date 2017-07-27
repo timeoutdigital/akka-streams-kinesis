@@ -6,8 +6,10 @@ import java.util.Date
 
 import akka.NotUsed
 import akka.stream.scaladsl.Source
+import akka.stream.stage.GraphStageLogic.EagerTerminateOutput
 import akka.stream.stage._
 import akka.stream.{Attributes, Outlet, SourceShape}
+import com.amazonaws.AmazonServiceException.ErrorType
 import com.amazonaws.AmazonWebServiceRequest
 import com.amazonaws.handlers.AsyncHandler
 import com.amazonaws.services.kinesis.model._
@@ -15,7 +17,6 @@ import com.amazonaws.services.kinesis.AmazonKinesisAsync
 import com.timeout.KinesisSource.IteratorType
 
 import scala.collection.JavaConverters._
-import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success, Try}
 
 object KinesisSource {
@@ -33,11 +34,14 @@ object KinesisSource {
     case object Latest extends IteratorType
   }
 
+  private [timeout] case class ShardId(value: String) extends AnyVal
+
   /**
     * A wrapper for a Kinesis shard iterator, that knows how to reissue itself
     * should it expire due to the 5 minute iterator validity cutoff
     */
   private [timeout] case class ShardIterator(
+    shard: ShardId,
     iterator: String,
     reissue: GetShardIteratorRequest
   )
@@ -57,7 +61,7 @@ object KinesisSource {
         .withShardIteratorType("AFTER_SEQUENCE_NUMBER")
         .withStartingSequenceNumber(lastRecord.getSequenceNumber)
     }
-    ShardIterator(g.getNextShardIterator, reissue)
+    ShardIterator(s.shard, g.getNextShardIterator, reissue)
   }
 
   /**
@@ -80,17 +84,18 @@ object KinesisSource {
     */
   private[timeout] def shardIteratorRequests(
     iteratorType: IteratorType,
-    stream: StreamDescription
+    shards: List[ShardId],
+    stream: String
   )(
     implicit
     clock: Clock
-  ): List[GetShardIteratorRequest] =
-    stream.getShards.asScala.toList.map { shard =>
+  ): List[(ShardId, GetShardIteratorRequest)] =
+    shards.map { shard =>
       val request = new GetShardIteratorRequest()
-        .withStreamName(stream.getStreamName)
-        .withShardId(shard.getShardId)
+        .withStreamName(stream)
+        .withShardId(shard.value)
 
-      iteratorType match {
+      val withIteratorType = iteratorType match {
         case IteratorType.AtTimestamp(since) =>
           val now = ZonedDateTime.now(clock)
           val readFrom = if (since.isBefore(now)) since else now
@@ -100,7 +105,62 @@ object KinesisSource {
         case IteratorType.Latest =>
           request.withShardIteratorType("LATEST")
       }
+      shard -> withIteratorType
     }
+
+  /**
+    * Given a Kinesis Stream, and an optional parent shard to find children of,
+    * produce a list of either top level shards (if no parent) or child shards
+    */
+  private [timeout] def findOldestPossibleShards(
+    stream: DescribeStreamResult
+  ) = {
+    val awsShards = stream.getStreamDescription.getShards.asScala.toList
+    val awsShardIds = awsShards.map(_.getShardId).toSet
+
+    awsShards
+      .map(s => if (!awsShardIds.contains(s.getParentShardId)) s.withParentShardId(null) else s)
+      .filter(s => s.getParentShardId == null)
+      .map(s => ShardId(s.getShardId))
+  }
+
+  /**
+    * If we've asked to read LATEST we don't want to find the oldest shards,
+    * we want to find the newest shards, so exclude any shards with children
+    */
+  private [timeout] def findNewestPossibleShards(
+    stream: DescribeStreamResult
+  ) = {
+    val awsShards = stream.getStreamDescription.getShards.asScala.toList
+    val parentShardIds: Set[String] = awsShards.flatMap { s =>
+      Option(s.getParentShardId) ++ Option(s.getAdjacentParentShardId)
+    }.toSet
+    awsShards
+      .filterNot(s => parentShardIds.contains(s.getShardId))
+      .map(s => ShardId(s.getShardId))
+  }
+
+  /**
+    * Find shards which are descendants of the given shard ID
+    * We ignore adjacentParentId so in the case of shards being merged we only get one child
+    */
+  private [timeout] def findChildShards(
+    stream: DescribeStreamResult,
+    parent: ShardId
+  ): List[ShardId] = {
+    stream.getStreamDescription.getShards.asScala.toList.collect {
+      case s if s.getParentShardId == parent.value => ShardId(s.getShardId)
+    }
+  }
+
+  /**
+    * when we're reading LATEST and need to begin reading from a new shard we want to TRIM_HORIZON it
+    * just to ensure we don't miss any records added during our describe stream call
+    */
+  private [timeout] def iteratorForReshard(iterator: IteratorType) = iterator match {
+    case IteratorType.Latest => IteratorType.TrimHorizon
+    case it => it
+  }
 }
 
 /**
@@ -116,10 +176,11 @@ private[timeout] class KinesisSource(
 ) extends GraphStage[SourceShape[ByteBuffer]] {
 
   import KinesisSource._
-  val outlet = Outlet[ByteBuffer]("Kinesis Records")
-  override def shape = SourceShape[ByteBuffer](outlet)
+  private val outlet = Outlet[ByteBuffer]("Kinesis Records")
+  override def shape: SourceShape[ByteBuffer] = SourceShape[ByteBuffer](outlet)
 
   override def createLogic(attrs: Attributes) = new GraphStageLogic(shape) with StageLogging {
+    setHandler(outlet, EagerTerminateOutput)
 
     /**
       * Adapt Amazon's 2 argument AsyncHandler based functions to execute a block on completion,
@@ -137,31 +198,54 @@ private[timeout] class KinesisSource(
     ) = {
       val callback = getAsyncCallback[Try[Resp]](whenDone)
       val handler = new AsyncHandler[Req, Resp] {
-        override def onError(exception: Exception) = callback.invoke(Failure(exception))
-        override def onSuccess(request: Req, result: Resp) = callback.invoke(Success(result))
+        override def onError(exception: Exception): Unit = callback.invoke(Failure(exception))
+        override def onSuccess(request: Req, result: Resp): Unit = callback.invoke(Success(result))
       }
       amazonAsyncFunction(requestArgument, handler)
     }
 
     /**
-      * We don't want to respond to any pull events from downstream
-      * as we're going to push records to them as quickly as we can
+      * Set up the asynchronous mutual recursion getRecords -> emitThenGetRecords / reissueThenGetRecords loop
+      * for a particular list of shards and a particular shard iterator type
       */
-    setHandler(outlet, new OutHandler {
-      override def onPull() = Unit
-    })
+    private def beginReadingFromShards(shards: List[ShardId], iteratorType: IteratorType): Unit = {
+      shardIteratorRequests(iteratorType, shards, streamName).foreach { case (shard, request) =>
+        run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
+          Option(iteratorResult.get.getShardIterator).fold {
+            log.warning(s"$streamName: No iterator for $shard")
+            handleReshard(shard)
+          } { it =>
+            log.debug(s"$streamName: Beginning to read from ${shard.value} at $iteratorType")
+            getRecords(ShardIterator(shard, it, request))
+          }
+        }
+      }
+    }
+
+    /**
+      * Handle a shard being closed,
+      * i.e. find its children and read from them
+      */
+    private def handleReshard(closedShard: ShardId): Unit = {
+      run(streamName)(kinesis.describeStreamAsync) { stream =>
+        val shards: List[ShardId] = findChildShards(stream.get, closedShard)
+        val newIterator = iteratorForReshard(iterator)
+        beginReadingFromShards(shards, newIterator)
+      }
+    }
 
     /**
       * bootstrap everything by getting initial shard iterators
       * Any errors here are essentially unrecoverable so we explode, hence the .gets
       */
-    run(streamName)(kinesis.describeStreamAsync) { stream =>
-      shardIteratorRequests(iterator, stream.get.getStreamDescription).foreach { request =>
-        run(request)(kinesis.getShardIteratorAsync) { iteratorResult =>
-          getRecords(ShardIterator(iteratorResult.get.getShardIterator, request))
+    override def preStart(): Unit =
+      run(streamName)(kinesis.describeStreamAsync) { stream =>
+        val shards = iterator match {
+          case IteratorType.Latest => findNewestPossibleShards(stream.get)
+          case _ => findOldestPossibleShards(stream.get)
         }
+        beginReadingFromShards(shards, iterator)
       }
-    }
 
     /**
       * Get records from Kinesis, then call handleResult
@@ -179,7 +263,12 @@ private[timeout] class KinesisSource(
       */
     private def emitThenGetRecords(currentIterator: ShardIterator, result: GetRecordsResult): Unit = {
       emitMultiple[ByteBuffer](outlet, result.getRecords.asScala.map(_.getData).toList, { () =>
-        getRecords(nextIterator(currentIterator, result))
+        Option(result.getNextShardIterator).fold {
+          log.debug(s"${currentIterator.shard.value} has been closed")
+          handleReshard(currentIterator.shard)
+        } { _ =>
+          getRecords(nextIterator(currentIterator, result))
+        }
       })
     }
 
@@ -201,11 +290,14 @@ private[timeout] class KinesisSource(
     private def handleResult(iterator: ShardIterator)(res: Try[GetRecordsResult]) = res match {
       case Success(recordsResult) =>
         emitThenGetRecords(iterator, recordsResult)
-      case Failure(_: ExpiredIteratorException) =>
-        reissueThenGetRecords(iterator)
+     case Failure(_: ProvisionedThroughputExceededException) =>
+        getRecords(iterator)
+     case Failure(error: AmazonKinesisException) if error.getErrorType == ErrorType.Client =>
+        throw error // any client errors are bugs in this library
       case Failure(error) =>
         log.error(error.getMessage)
-        getRecords(iterator)
+        reissueThenGetRecords(iterator)
     }
   }
+
 }
