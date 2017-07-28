@@ -229,14 +229,6 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
         data.sorted shouldEqual latestShardContents.map(_._2)
       }
     }
-
-    "Should reissue iterators after five minutes of inactivity" taggedAs Slow in {
-      pushToStream(List(1 -> "a", 1 -> "aa"))
-      val reading = readDelayed
-      whenReady(reading, timeout = Timeout(10.minutes)) { data =>
-        data.sorted shouldEqual Vector("a", "aa")
-      }
-    }
   }
 
   /**
@@ -252,21 +244,4 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
       .map(b => new String(b.array))
       .groupedWithin(number * 2, timeOut.getOrElse((number * 2).seconds))
       .runWith(Sink.head)
-
-  /**
-    * Read two records from Kinesis, backpressuring
-    * for six minutes to expire the shard iterator
-    */
-  private def readDelayed: Future[Seq[String]] = {
-    val allowThroughAt = ZonedDateTime.now().plusMinutes(6)
-    KinesisSource(kinesis, streamName, TrimHorizon)
-      .map(b => new String(b.array))
-      .mapAsync(parallelism = 1) { b =>
-        val p = Promise[String]()
-        val delay = Math.max(allowThroughAt.toEpochSecond - ZonedDateTime.now.toEpochSecond, 0)
-        as.scheduler.scheduleOnce(delay.seconds)(p.success(b))
-        p.future
-      }.groupedWithin(2, 7.minutes)
-      .runWith(Sink.head)
-  }
 }
