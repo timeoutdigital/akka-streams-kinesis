@@ -1,5 +1,6 @@
 package com.timeout
 
+import java.nio.ByteBuffer
 import java.time.{Clock, ZonedDateTime}
 import java.util.Date
 
@@ -8,11 +9,14 @@ import akka.stream.scaladsl.Sink
 import com.amazonaws.services.kinesis.model.{DescribeStreamResult, Shard, StreamDescription}
 import com.timeout.KinesisSource.{IteratorType, ShardId}
 import com.timeout.KinesisSource.IteratorType.{Latest, TrimHorizon}
+import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.concurrent.ScalaFutures
 import org.scalatest.{FreeSpec, Matchers}
+import org.scalatest.tagobjects.Slow
 
 import scala.collection.JavaConverters._
-import scala.concurrent.Future
+import scala.collection.immutable
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration._
 
 class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
@@ -209,8 +213,9 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
     "Should only get records from the latest shards when reading LATEST" in {
       /*
        * We do two reshards because any detected reshards when reading LATEST
-       * will begin reading the new shards from TRIM_HORIZON, so if we get any info from the first two shard sets
-       * we know that getNewestPossibleShards isn't working too well
+       * will begin reading the new shards from TRIM_HORIZON, so if
+       * we get any info from the first two shard sets we know that
+       * getNewestPossibleShards isn't working too well
        */
       pushToStream(List(1 -> "a", 2 -> "aa"))
       splitShards()
@@ -224,15 +229,44 @@ class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with Ki
         data.sorted shouldEqual latestShardContents.map(_._2)
       }
     }
+
+    "Should reissue iterators after five minutes of inactivity" taggedAs Slow in {
+      pushToStream(List(1 -> "a", 1 -> "aa"))
+      val reading = readDelayed
+      whenReady(reading, timeout = Timeout(10.minutes)) { data =>
+        data.sorted shouldEqual Vector("a", "aa")
+      }
+    }
   }
 
   /**
     * Read a certain number of records from Kinesis
     */
-  private def readN(number: Int, it: IteratorType = TrimHorizon): Future[Seq[String]] =
+  private def readN(
+    number: Int,
+    it: IteratorType = TrimHorizon,
+    timeOut: Option[FiniteDuration] = None
+  ): Future[Seq[String]] =
     KinesisSource(kinesis, streamName, it)
       .throttle(1, 2.second, 1, ThrottleMode.shaping) // https://github.com/mhart/kinesalite/pull/36
       .map(b => new String(b.array))
-      .groupedWithin(number * 2, (number * 2).seconds)
+      .groupedWithin(number * 2, timeOut.getOrElse((number * 2).seconds))
       .runWith(Sink.head)
+
+  /**
+    * Read two records from Kinesis, backpressuring
+    * for six minutes to expire the shard iterator
+    */
+  private def readDelayed: Future[Seq[String]] = {
+    val allowThroughAt = ZonedDateTime.now().plusMinutes(6)
+    KinesisSource(kinesis, streamName, TrimHorizon)
+      .map(b => new String(b.array))
+      .mapAsync(parallelism = 1) { b =>
+        val p = Promise[String]()
+        val delay = Math.max(allowThroughAt.toEpochSecond - ZonedDateTime.now.toEpochSecond, 0)
+        as.scheduler.scheduleOnce(delay.seconds)(p.success(b))
+        p.future
+      }.groupedWithin(2, 7.minutes)
+      .runWith(Sink.head)
+  }
 }

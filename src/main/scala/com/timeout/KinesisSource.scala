@@ -290,13 +290,15 @@ private[timeout] class KinesisSource(
     private def handleResult(iterator: ShardIterator)(res: Try[GetRecordsResult]) = res match {
       case Success(recordsResult) =>
         emitThenGetRecords(iterator, recordsResult)
-     case Failure(_: ProvisionedThroughputExceededException) =>
-        getRecords(iterator)
-     case Failure(error: AmazonKinesisException) if error.getErrorType == ErrorType.Client =>
-        throw error // any client errors are bugs in this library
-      case Failure(error) =>
-        log.error(error.getMessage)
+      case Failure(_: ExpiredIteratorException) =>
         reissueThenGetRecords(iterator)
+      case Failure(_: ProvisionedThroughputExceededException) =>
+        getRecords(iterator)
+      case Failure(error: AmazonKinesisException) if error.getErrorType == ErrorType.Service =>
+        log.error(s"Service error from Kinesis: ${error.getMessage}")
+        getRecords(iterator)
+      case Failure(error: AmazonKinesisException) if error.getErrorType == ErrorType.Client =>
+        throw error // any client errors are bugs in this library
     }
   }
 

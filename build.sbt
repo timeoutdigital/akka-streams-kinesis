@@ -6,7 +6,7 @@ licenses += ("MIT", url("https://opensource.org/licenses/MIT"))
 
 scalaVersion := "2.11.11"
 
-crossScalaVersions := Seq("2.11.11", "2.12.2")
+crossScalaVersions := Seq("2.11.11", "2.12.3")
 
 releaseCrossBuild := true
 
