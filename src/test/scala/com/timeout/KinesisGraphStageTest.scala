@@ -31,7 +31,7 @@ class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceC
     result((1 to r.getRecords.size).map(_ => resultEntry.withErrorMessage("Failure").withErrorCode("F")))
 
   def kinesis(client: KinesisGraphStage.PutRecords) =
-    new KinesisGraphStage[PutRecordsRequestEntry](client, "test")
+    new KinesisGraphStage[PutRecordsRequestEntry](client, "test", 250 )
 
 
   "Kinesis graph stage" - {

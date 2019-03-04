@@ -21,11 +21,15 @@ object KinesisGraphStage {
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
 
   private[KinesisGraphStage] val maxBufferSize = 500 // hard limit imposed by AWS
-  private[KinesisGraphStage] val sendingThreshold = 250
+  private[KinesisGraphStage] val defaultSendingThreshold = 250 // number of entires
   private[KinesisGraphStage] val kinesisBackoffTime = 800
+  private[KinesisGraphStage] val maxRequestSize = 5000000 // in bytes; limit imposed by AWS
 
-  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
-    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
+  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis,
+                                          streamName: String,
+                                          sendingThreshold: Int = defaultSendingThreshold
+                                         ): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
+    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName, sendingThreshold))
 }
 
 /**
@@ -34,7 +38,7 @@ object KinesisGraphStage {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String)
+class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String, sendingThreshold: Int)
   extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]] {
 
   private val in = Inlet[A]("PutRecordsRequestEntry")
@@ -71,6 +75,26 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
     }
 
     /**
+      * Split
+      */
+    private def splitBySize(entries: List[PutRecordsRequestEntry]): List[List[PutRecordsRequestEntry]] = {
+      val zero = 0 -> List.empty[PutRecordsRequestEntry] -> List.empty[List[PutRecordsRequestEntry]]
+      entries.foldLeft(zero) { case (((total, newList), lists), entry) =>
+        val size = entry.getData.limit() // an approximation, as in the request it will have different size
+        if (total + size > maxRequestSize)
+          size -> List(entry) -> (lists :+ newList)
+        else
+          (total + size) -> (newList :+ entry) -> lists
+      } match {
+        case ((_, newList), lists) =>
+          if (newList.nonEmpty)
+            lists :+ newList
+          else
+            lists
+      }
+    }
+
+    /**
       * Take everything in inputBuffer and push it to kinesis with kinesisWorkerThread
       * If we get throughput exceeded issues we will block the kinesis worker for a 800ms
       * to give it a chance to recover, then put the failed items back onto the buffer
@@ -81,18 +105,24 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
       recordsInFlight = dataToPush.size
 
       Future {
-        // everything in here happens in the worker thread
-        val request = new PutRecordsRequest()
-          .withRecords(dataToPush.map(_.toRequestEntry).asJava)
-          .withStreamName(streamName)
+        val maxSize = 0
+
+        val grouppedData: List[List[PutRecordsRequestEntry]] = splitBySize(dataToPush.map(_.toRequestEntry))
 
         def incrementalBackoff(err: Throwable, n: Int): Unit = {
-          val waitSec = Math.pow(2, n).toInt
-          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
+          val waitSec = Math.pow(2, Math.max(n, 12)).toInt // Don't not wait longer than 4096 seconds between two next tries
+          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds (try #$n)")
           Thread.sleep(waitSec * 1000)
         }
 
-        val results = withRetries(putRecords(request), onError = incrementalBackoff).getRecords.asScala
+        val resultsByRequest = for {
+          dataToPush <- grouppedData
+          request = new PutRecordsRequest()
+            .withRecords(dataToPush.asJava)
+            .withStreamName(streamName)
+        } yield withRetries(putRecords(request), onError = incrementalBackoff).getRecords.asScala.toList
+        val results = resultsByRequest.flatten
+
         /*
          * We rate limit ourselves here in the worker thread
          * Blocking in getAsyncCallback would block the entire stream
