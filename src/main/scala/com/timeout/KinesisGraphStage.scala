@@ -19,13 +19,15 @@ object KinesisGraphStage {
 
   type PutRecords = PutRecordsRequest => PutRecordsResult
   val ProvisionedThroughputExceededExceptionCode = "ProvisionedThroughputExceededException"
+  val LimitExceededExceptionCode = "LimitExceededException"
 
-  private[KinesisGraphStage] val maxBufferSize = 500 // hard limit imposed by AWS
-  private[KinesisGraphStage] val sendingThreshold = 250
+  private[KinesisGraphStage] val awsMaxBufferSize = 500 // hard limit imposed by AWS
+  private[KinesisGraphStage] val defaultSendingThreshold = 250
   private[KinesisGraphStage] val kinesisBackoffTime = 800
 
-  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis, streamName: String): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
-    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName))
+  def withClient[A : ToPutRecordsRequest](client: AmazonKinesis, streamName: String, sendingThreshold: Int = defaultSendingThreshold,
+                                          maxBufferSize: Int = awsMaxBufferSize): Flow[A, Either[PutRecordsResultEntry, A], NotUsed] =
+    Flow.fromGraph(new KinesisGraphStage[A](client.putRecords, streamName, sendingThreshold, maxBufferSize))
 }
 
 /**
@@ -34,7 +36,8 @@ object KinesisGraphStage {
   * This graph stage maintains a buffer of items to push to kinesis and flushes it when full
   * The trick is that it then puts any failed items back into the buffer
   */
-class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String)
+class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamName: String, sendingThreshold: Int,
+                                                 maxBufferSize: Int)
   extends GraphStage[FlowShape[A, Either[PutRecordsResultEntry, A]]] {
 
   private val in = Inlet[A]("PutRecordsRequestEntry")
@@ -88,7 +91,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
 
         def incrementalBackoff(err: Throwable, n: Int): Unit = {
           val waitSec = Math.pow(2, n).toInt
-          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds")
+          log.error(s"Error while trying to push to Kinesis: $err.\nBacking off for $waitSec seconds (retry #$n)")
           Thread.sleep(waitSec * 1000)
         }
 
