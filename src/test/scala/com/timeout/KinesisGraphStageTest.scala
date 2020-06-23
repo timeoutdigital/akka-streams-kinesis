@@ -4,11 +4,11 @@ import java.nio.ByteBuffer
 import akka.stream.scaladsl.{Sink, Source}
 import com.amazonaws.services.kinesis.model.{PutRecordsRequestEntry, PutRecordsResult, PutRecordsResultEntry}
 import com.timeout.KinesisGraphStage._
-import org.scalatest.Matchers
 import org.scalatest.concurrent.{PatienceConfiguration, ScalaFutures}
+import org.scalatest.matchers.should.Matchers
 import org.scalatest.time.{Millis, Seconds, Span}
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 class KinesisGraphStageTest extends AkkaStreamsTest with Matchers with PatienceConfiguration with ScalaFutures {
   implicit override val patienceConfig = PatienceConfig(timeout = Span(5, Seconds), interval = Span(5, Millis))

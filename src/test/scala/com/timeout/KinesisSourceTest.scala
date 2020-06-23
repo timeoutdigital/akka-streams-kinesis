@@ -1,25 +1,22 @@
 package com.timeout
 
-import java.nio.ByteBuffer
 import java.time.{Clock, ZonedDateTime}
 import java.util.Date
 
 import akka.stream.ThrottleMode
 import akka.stream.scaladsl.Sink
 import com.amazonaws.services.kinesis.model.{DescribeStreamResult, Shard, StreamDescription}
-import com.timeout.KinesisSource.{IteratorType, ShardId}
 import com.timeout.KinesisSource.IteratorType.{Latest, TrimHorizon}
-import org.scalatest.concurrent.PatienceConfiguration.Timeout
+import com.timeout.KinesisSource.{IteratorType, ShardId}
 import org.scalatest.concurrent.ScalaFutures
-import org.scalatest.{FreeSpec, Matchers}
-import org.scalatest.tagobjects.Slow
+import org.scalatest.freespec.AnyFreeSpec
+import org.scalatest.matchers.should.Matchers
 
-import scala.collection.JavaConverters._
-import scala.collection.immutable
-import scala.concurrent.{Future, Promise}
+import scala.jdk.CollectionConverters._
+import scala.concurrent.Future
 import scala.concurrent.duration._
 
-class KinesisSourceTest extends FreeSpec with Matchers with ScalaFutures with KinesaliteTest {
+class KinesisSourceTest extends AnyFreeSpec with Matchers with ScalaFutures with KinesaliteTest {
 
   val now = ZonedDateTime.parse("2017-01-01T07:00:00Z")
   implicit val clock = Clock.fixed(now.toInstant, now.getZone)
