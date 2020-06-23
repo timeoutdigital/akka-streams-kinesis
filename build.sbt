@@ -18,9 +18,7 @@ libraryDependencies += "org.slf4j" % "slf4j-nop" % "1.7.30" % "test"
 
 credentials += Credentials(Path.userHome / ".bintray" / ".credentials")
 
+resolvers += Resolver.bintrayRepo("timeoutdigital", "releases")
+
 lazy val root = (project in file("."))
   .settings(BintrayPlugin.bintrayPublishSettings: _*)
-  .settings(Seq(
-    bintrayOrganization := Some("timeoutdigital"),
-    bintrayRepository := "releases"
-  ))
