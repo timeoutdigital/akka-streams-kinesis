@@ -11,7 +11,7 @@ import com.amazonaws.services.kinesis.model._
 import com.timeout.KinesisGraphStage.PutRecords
 import com.timeout.ToPutRecordsRequest._
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -55,7 +55,7 @@ class KinesisGraphStage[A : ToPutRecordsRequest](putRecords: PutRecords, streamN
       * Respond to any kind of stream event
       */
     private def streamStateChanged(newRecords: List[A] = List.empty) = {
-      inputBuffer.enqueue(newRecords: _*)
+      inputBuffer.enqueueAll(newRecords)
 
       // is the buffer empty and the producer closed? We're done here
       if (inputBuffer.isEmpty && isClosed(in) && recordsInFlight < 1) {

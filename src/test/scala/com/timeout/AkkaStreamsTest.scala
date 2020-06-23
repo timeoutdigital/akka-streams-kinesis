@@ -1,14 +1,13 @@
 package com.timeout
 
 import akka.actor.ActorSystem
-import akka.stream.ActorMaterializer
-import org.scalatest.{BeforeAndAfterAll, FreeSpec}
+import org.scalatest.BeforeAndAfterAll
+import org.scalatest.freespec.AnyFreeSpec
 
-trait AkkaStreamsTest extends FreeSpec with BeforeAndAfterAll {
+trait AkkaStreamsTest extends AnyFreeSpec with BeforeAndAfterAll {
 
   implicit val as = ActorSystem()
-  implicit val mat = ActorMaterializer()
-  implicit val ec = mat.executionContext
+  implicit val ec = as.dispatcher
 
   override def afterAll() = {
     super.afterAll()
